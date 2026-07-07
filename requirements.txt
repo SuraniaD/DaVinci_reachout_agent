@@ -5,3 +5,4 @@ supabase
 pandas
 openpyxl
 duckduckgo-search
+requests
