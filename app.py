@@ -166,7 +166,7 @@ def handle_file_upload(event: dict, say, user_id: str):
 
     try:
         file_path = download_slack_file(file_info)
-        contacts  = read_contact_list(file_path)
+        contacts  = read_contact_list(file_path, user_id)
 
         if not contacts:
             say("⚠️ The file was empty or had no valid contacts.")
