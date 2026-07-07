@@ -1,0 +1,7 @@
+groq
+slack-bolt
+python-dotenv
+supabase
+pandas
+openpyxl
+duckduckgo-search
