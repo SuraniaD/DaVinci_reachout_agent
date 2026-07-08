@@ -118,7 +118,7 @@ def chat_with_riley(user_id: str, user_message: str) -> str:
 
     try:
         response = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
+            model="llama-3.3-70b-versatile",
             messages=[
                 {"role": "system", "content": RILEY_SYSTEM_PROMPT}
             ] + messages,
@@ -169,7 +169,7 @@ Do not use generic filler. Max 120 words in body.
 
     try:
         response = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
+            model="llama-3.3-70b-versatile",
             messages=[
                 {"role": "system", "content": RILEY_SYSTEM_PROMPT}
             ] + messages,
