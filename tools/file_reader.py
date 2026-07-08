@@ -1,62 +1,43 @@
 import pandas as pd
-from agents.riley import chat_with_riley
 from interaction_log import log_action
 
 
 def detect_columns(df: pd.DataFrame) -> dict:
     """
-    Looks at the actual column names in the uploaded file
-    and figures out which column maps to name, business, and email.
-
-    Uses fuzzy matching first — catches obvious variations like
-    "Name", "Full Name", "Contact Name", "Company", "Org" etc.
-
-    If fuzzy matching can't figure it out confidently,
-    falls back to asking Groq to interpret the columns.
-
-    Returns a dict like:
-    {
-        "name":          "Contact Name",
-        "business_name": "Organisation",
-        "email":         "Email Address"
-    }
+    Fuzzy matches column names to name, business_name, email.
+    Handles variations like 'Full Name', 'Company', 'Email Address' etc.
     """
-    columns = list(df.columns)
+    columns       = list(df.columns)
     columns_lower = [c.lower().strip() for c in columns]
+    col_map       = {c.lower().strip(): c for c in columns}
+    result        = {}
 
-    # Build a map of original column → lowercased
-    col_map = {c.lower().strip(): c for c in columns}
-
-    result = {}
-
-    # ── NAME COLUMN ──────────────────────────
+    # NAME
     name_hints = [
         "name", "full name", "contact name", "first name",
-        "person", "contact", "lead name", "prospect"
+        "person", "contact", "lead name", "prospect", "owner"
     ]
     for hint in name_hints:
         if hint in columns_lower:
             result["name"] = col_map[hint]
             break
-    # Partial match fallback
     if "name" not in result:
         for col in columns_lower:
             if "name" in col:
                 result["name"] = col_map[col]
                 break
 
-    # ── BUSINESS COLUMN ──────────────────────
+    # BUSINESS
     business_hints = [
         "business_name", "business name", "company",
         "company name", "organisation", "organization",
         "org", "firm", "brand", "account", "employer",
-        "business", "startup", "agency"
+        "business", "startup", "agency", "venture"
     ]
     for hint in business_hints:
         if hint in columns_lower:
             result["business_name"] = col_map[hint]
             break
-    # Partial match fallback
     if "business_name" not in result:
         for col in columns_lower:
             if any(w in col for w in [
@@ -65,7 +46,7 @@ def detect_columns(df: pd.DataFrame) -> dict:
                 result["business_name"] = col_map[col]
                 break
 
-    # ── EMAIL COLUMN ─────────────────────────
+    # EMAIL
     email_hints = [
         "email", "email address", "e-mail",
         "e mail", "mail", "contact email",
@@ -75,7 +56,6 @@ def detect_columns(df: pd.DataFrame) -> dict:
         if hint in columns_lower:
             result["email"] = col_map[hint]
             break
-    # Partial match fallback
     if "email" not in result:
         for col in columns_lower:
             if "mail" in col or "email" in col:
@@ -85,20 +65,9 @@ def detect_columns(df: pd.DataFrame) -> dict:
     return result
 
 
-def ask_riley_to_map_columns(columns: list, user_id: str) -> dict:
+def ask_groq_to_map_columns(columns: list, user_id: str) -> dict:
     """
-    If fuzzy matching can't confidently identify columns,
-    ask Groq to interpret them.
-
-    For example if columns are:
-    ["Prospect", "Venture", "Contact Info"]
-
-    Groq figures out:
-    {
-        "name":          "Prospect",
-        "business_name": "Venture",
-        "email":         "Contact Info"
-    }
+    Falls back to Groq if fuzzy matching can't identify columns.
     """
     prompt = f"""
 I have a spreadsheet with these column names:
@@ -109,12 +78,12 @@ I need to identify which column represents:
 2. The business or company name
 3. The email address
 
-Reply in this exact format and nothing else — no explanation:
+Reply in this exact format and nothing else:
 name_column: <exact column name>
 business_column: <exact column name>
 email_column: <exact column name>
 
-If you cannot identify a column confidently, write: unknown
+If you cannot identify a column, write: unknown
 """
     try:
         from agents.riley import chat_with_riley
@@ -144,28 +113,13 @@ If you cannot identify a column confidently, write: unknown
 
 def read_contact_list(
     file_path: str,
-    user_id: str = "system"
+    user_id:   str = "system"
 ) -> list[dict]:
     """
-    Reads a CSV or Excel file and returns a clean list
-    of contact dictionaries.
-
-    Automatically detects which columns map to
-    name, business_name, and email — regardless of
-    what the columns are actually called in the file.
-
-    Returns:
-        [
-            {
-                "name":          "Priya Sharma",
-                "business_name": "GreenLeaf Organics",
-                "email":         "priya@greenleaf.com"
-            },
-            ...
-        ]
+    Reads CSV or Excel and returns clean list of contacts.
+    Automatically detects columns regardless of header names.
     """
     try:
-        # ── READ THE FILE ────────────────────────
         if file_path.endswith(".csv"):
             df = pd.read_csv(file_path)
         elif file_path.endswith((".xlsx", ".xls")):
@@ -181,71 +135,51 @@ def read_contact_list(
 
         print(f"📋 File columns found: {list(df.columns)}")
 
-        # ── DETECT COLUMN MAPPING ────────────────
+        # Try fuzzy matching first
         mapping = detect_columns(df)
 
-        # If fuzzy matching missed any column
-        # ask Groq to interpret the columns
-        missing = []
-        if "name" not in mapping:
-            missing.append("name")
-        if "business_name" not in mapping:
-            missing.append("business_name")
-        if "email" not in mapping:
-            missing.append("email")
+        # Find what's still missing
+        missing = [
+            k for k in ["name", "business_name", "email"]
+            if k not in mapping
+        ]
 
+        # Ask Groq for anything fuzzy matching couldn't find
         if missing:
             print(
-                f"⚠️ Could not auto-detect columns: {missing}. "
+                f"⚠️ Could not auto-detect: {missing}. "
                 f"Asking Riley to interpret..."
             )
-            groq_mapping = ask_riley_to_map_columns(
+            groq_mapping = ask_groq_to_map_columns(
                 list(df.columns), user_id
             )
-            # Merge — only fill in the gaps
             for key in missing:
                 if key in groq_mapping:
                     mapping[key] = groq_mapping[key]
 
-        print(f"✅ Column mapping resolved: {mapping}")
-
-        # ── STILL MISSING AFTER GROQ? ────────────
-        # Use whatever columns exist as best-effort fallback
+        # Last resort — use column position
         all_cols = list(df.columns)
-
         if "name" not in mapping and len(all_cols) >= 1:
             mapping["name"] = all_cols[0]
-            print(f"⚠️ Falling back: using '{all_cols[0]}' as name")
-
+            print(f"⚠️ Using '{all_cols[0]}' as name")
         if "business_name" not in mapping and len(all_cols) >= 2:
             mapping["business_name"] = all_cols[1]
-            print(
-                f"⚠️ Falling back: "
-                f"using '{all_cols[1]}' as business_name"
-            )
-
+            print(f"⚠️ Using '{all_cols[1]}' as business_name")
         if "email" not in mapping and len(all_cols) >= 3:
             mapping["email"] = all_cols[2]
-            print(f"⚠️ Falling back: using '{all_cols[2]}' as email")
+            print(f"⚠️ Using '{all_cols[2]}' as email")
 
-        # ── BUILD CONTACT LIST ───────────────────
+        print(f"✅ Column mapping: {mapping}")
+
+        # Build clean contact list
         contacts = []
         for _, row in df.iterrows():
-            name = str(
-                row.get(mapping.get("name", ""), "")
-            ).strip()
-            business = str(
-                row.get(mapping.get("business_name", ""), "")
-            ).strip()
-            email = str(
-                row.get(mapping.get("email", ""), "")
-            ).strip().lower()
+            name     = str(row.get(mapping.get("name", ""), "")).strip()
+            business = str(row.get(mapping.get("business_name", ""), "")).strip()
+            email    = str(row.get(mapping.get("email", ""), "")).strip().lower()
 
-            # Skip rows with no name or no email
             if not name or not email:
                 continue
-
-            # Skip rows where email doesn't look like an email
             if "@" not in email:
                 continue
 
@@ -257,33 +191,25 @@ def read_contact_list(
 
         if not contacts:
             raise ValueError(
-                "No valid contacts found in the file. "
-                "Make sure the file has at least "
-                "name and email columns."
+                "No valid contacts found. "
+                "Make sure the file has name and email columns."
             )
 
-        # ── LOG AND RETURN ───────────────────────
         log_action(
             action_type="file_read",
             detail=(
                 f"Read {len(contacts)} contacts. "
-                f"Column mapping: {mapping}"
+                f"Mapping: {mapping}"
             )
         )
 
-        print(f"✅ {len(contacts)} contacts loaded successfully")
+        print(f"✅ {len(contacts)} contacts loaded")
         return contacts
 
     except ValueError as e:
-        log_action(
-            action_type="error",
-            detail=f"File read failed: {str(e)}"
-        )
+        log_action(action_type="error", detail=f"File read failed: {str(e)}")
         raise
 
     except Exception as e:
-        log_action(
-            action_type="error",
-            detail=f"File read unexpected error: {str(e)}"
-        )
+        log_action(action_type="error", detail=f"File read error: {str(e)}")
         raise Exception(f"Could not read file: {str(e)}")

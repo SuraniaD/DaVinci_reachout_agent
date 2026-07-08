@@ -1,15 +1,15 @@
 import os
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+import resend
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 from database import supabase
 from interaction_log import log_action
 
 load_dotenv()
 
-GMAIL_ADDRESS     = os.environ.get("GMAIL_ADDRESS")
-GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")
+resend.api_key = os.environ.get("RESEND_API_KEY")
+FROM_EMAIL     = os.environ.get("RESEND_FROM_EMAIL", "riley@davinciai.agency")
+FROM_NAME      = os.environ.get("RESEND_FROM_NAME", "Riley, DaVinci AI")
 
 
 def send_email(
@@ -20,29 +20,24 @@ def send_email(
     business_name: str = None
 ) -> bool:
     """
-    Sends an email via Gmail SMTP.
-    Records the sent email in outreach_records table.
-
-    Returns True if sent successfully, False if failed.
+    Sends an email via Resend API.
+    Records the result in Supabase outreach_records.
+    Returns True if sent, False if failed.
     """
     try:
         print(f"📧 Sending email to {to_email}...")
 
-        # Build the email
-        msg = MIMEMultipart()
-        msg["From"]    = GMAIL_ADDRESS
-        msg["To"]      = to_email
-        msg["Subject"] = subject
-        msg.attach(MIMEText(body, "plain"))
+        params = {
+            "from":    f"{FROM_NAME} <{FROM_EMAIL}>",
+            "to":      [to_email],
+            "subject": subject,
+            "text":    body
+        }
 
-        # Connect to Gmail and send
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
-            server.send_message(msg)
+        response = resend.Emails.send(params)
 
-        print(f"✅ Email sent to {to_email}")
+        print(f"✅ Email sent to {to_email} — ID: {response['id']}")
 
-        # Record in outreach_records
         _record_outreach(
             contact_name=contact_name,
             business_name=business_name,
@@ -52,7 +47,6 @@ def send_email(
             status="sent"
         )
 
-        # Log the action
         log_action(
             action_type="sent",
             contact_name=contact_name,
@@ -65,7 +59,6 @@ def send_email(
     except Exception as e:
         print(f"❌ Failed to send email to {to_email}: {e}")
 
-        # Record the failure too — important for debugging
         _record_outreach(
             contact_name=contact_name,
             business_name=business_name,
@@ -92,10 +85,7 @@ def record_skipped(
     subject:       str = None,
     body:          str = None
 ):
-    """
-    Records a contact as skipped in outreach_records.
-    Called when you type 'skip' in the approval flow.
-    """
+    """Records a skipped contact in Supabase."""
     _record_outreach(
         contact_name=contact_name,
         business_name=business_name,
@@ -123,10 +113,7 @@ def _record_outreach(
     body:          str,
     status:        str
 ):
-    """
-    Private helper — writes one row to outreach_records.
-    Called by send_email() and record_skipped().
-    """
+    """Writes one row to outreach_records in Supabase."""
     try:
         row = {
             "contact_name":  contact_name,
@@ -137,9 +124,7 @@ def _record_outreach(
             "status":        status
         }
 
-        # Add sent_at timestamp only for sent emails
         if status == "sent":
-            from datetime import datetime, timezone
             row["sent_at"] = datetime.now(timezone.utc).isoformat()
 
         supabase.table("outreach_records").insert(row).execute()

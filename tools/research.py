@@ -4,13 +4,12 @@ from interaction_log import log_action
 
 def research_business(business_name: str) -> str:
     """
-    Searches the web for a business name.
-    Returns a short text summary of the top results.
+    Searches DuckDuckGo for a business.
+    Returns a text summary used to personalise the email.
     """
     try:
         print(f"🔍 Researching: {business_name}...")
 
-        # New ddgs API — no context manager, just call directly
         results = DDGS().text(business_name, max_results=4)
 
         if not results:

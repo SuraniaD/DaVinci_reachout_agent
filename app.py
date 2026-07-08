@@ -47,9 +47,9 @@ approval_state = {}
 
 def download_slack_file(file_info: dict) -> str:
     import requests
-    file_url  = file_info["url_private_download"]
+    file_url = file_info["url_private_download"]
     file_name = file_info["name"]
-    headers   = {
+    headers  = {
         "Authorization": f"Bearer {os.environ.get('RILEY_BOT_TOKEN')}"
     }
     response = requests.get(file_url, headers=headers)
@@ -67,7 +67,7 @@ def download_slack_file(file_info: dict) -> str:
 
 def process_next_contact(user_id: str, say):
     """
-    Runs in a background thread.
+    Always runs in a background thread.
     Picks next contact, researches, drafts,
     then either sends or waits for approval.
     """
@@ -79,7 +79,6 @@ def process_next_contact(user_id: str, say):
         remaining = state["remaining_contacts"]
         stats     = state["stats"]
 
-        # No more contacts — done
         if not remaining:
             total = (
                 stats["sent"] +
@@ -95,11 +94,8 @@ def process_next_contact(user_id: str, say):
             del approval_state[user_id]
             return
 
-        # Take the next contact
         contact = remaining.pop(0)
-
-        # Research + draft
-        result = process_contact(user_id, contact, say)
+        result  = process_contact(user_id, contact, say)
 
         if result is None:
             stats["failed"] += 1
@@ -112,7 +108,6 @@ def process_next_contact(user_id: str, say):
             return
 
         if is_auto_mode(user_id):
-            # AUTO-SEND
             success = send_approved_email(result)
             if success:
                 stats["sent"] += 1
@@ -134,7 +129,6 @@ def process_next_contact(user_id: str, say):
             t.start()
 
         else:
-            # APPROVAL MODE — post draft and wait
             state["pending_result"] = result
             say(format_draft_for_slack(result))
 
@@ -217,24 +211,20 @@ def handle_file_upload(event: dict, say, user_id: str):
 
 @app.event("message")
 def handle_dm(event, say):
-    # Ignore bot messages
     if event.get("bot_id"):
         return
-
-    # Only handle DMs
     if event.get("channel_type") != "im":
         return
 
     user_id = event["user"]
     text    = event.get("text", "").strip()
 
-    # ── FILE UPLOAD ──────────────────────────
+    # FILE UPLOAD
     if event.get("files"):
         handle_file_upload(event, say, user_id)
         return
 
-    # ── COMMANDS ─────────────────────────────
-
+    # COMMANDS
     if text.lower() == "!reset":
         clear_history("riley", user_id)
         say(
@@ -266,8 +256,7 @@ def handle_dm(event, say):
         )
         return
 
-    # ── APPROVAL FLOW ─────────────────────────
-
+    # APPROVAL FLOW
     if user_id in approval_state and \
        approval_state[user_id].get("pending_result"):
 
@@ -304,7 +293,7 @@ def handle_dm(event, say):
             process_next_contact(user_id, say)
             return
 
-        # Edit instructions — redraft
+        # Edit instructions
         say("Got it — redrafting with your feedback...")
         contact = result["contact"]
 
@@ -317,7 +306,7 @@ def handle_dm(event, say):
                 f"Original draft:\n{result['draft']}\n\n"
                 f"Please redraft incorporating the feedback."
             )
-            new_draft           = chat_with_riley(user_id, feedback_task)
+            new_draft             = chat_with_riley(user_id, feedback_task)
             new_subject, new_body = parse_draft(new_draft)
 
             state["pending_result"] = {
@@ -337,7 +326,7 @@ def handle_dm(event, say):
             )
         return
 
-    # ── GENERAL CHAT ─────────────────────────
+    # GENERAL CHAT
     say("_Thinking..._")
     reply = chat_with_riley(user_id, text)
     say(reply)

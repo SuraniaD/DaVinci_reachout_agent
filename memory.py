@@ -1,22 +1,16 @@
 import threading
 from database import supabase
 
-# In-RAM cache — fast to read from
-# Format: { "agent_name": { "slack_user_id": [ {role, content}, ... ] } }
 conversation_cache = {}
 
-MAX_HISTORY = 20  # max messages sent to Groq per call — keeps token usage low
+MAX_HISTORY = 20
 
-
-# ─────────────────────────────────────────
-# LOAD FROM SUPABASE ON STARTUP
-# ─────────────────────────────────────────
 
 def load_all_conversations():
     """
-    Called once when app.py starts.
-    Pulls all past conversations from Supabase into RAM cache.
-    Riley wakes up with full memory even after a restart.
+    Called once on startup.
+    Loads all past conversations from Supabase into RAM.
+    Riley wakes up with full memory after every restart.
     """
     try:
         result = supabase.table("conversations") \
@@ -40,47 +34,29 @@ def load_all_conversations():
                 "content": content
             })
 
-        print(f"✅ Memory loaded from Supabase — "
-              f"{len(result.data)} messages restored")
+        print(
+            f"✅ Memory loaded from Supabase — "
+            f"{len(result.data)} messages restored"
+        )
 
     except Exception as e:
         print(f"⚠️ Could not load memory from Supabase: {e}")
-        print("Starting with empty memory — "
-              "conversations will still be saved going forward")
+        print("Starting with empty memory")
 
-
-# ─────────────────────────────────────────
-# READ HISTORY (from RAM — instant)
-# ─────────────────────────────────────────
 
 def get_history(agent: str, user_id: str) -> list:
-    """
-    Returns the conversation history for a specific user with a specific agent.
-    Read from RAM — no database call, instant.
-    Capped at MAX_HISTORY to keep Groq token usage manageable.
-    """
+    """Read from RAM — instant, no database call."""
     history = conversation_cache \
         .get(agent, {}) \
         .get(user_id, [])
-
-    # Return only the last MAX_HISTORY messages
     return history[-MAX_HISTORY:]
 
 
-# ─────────────────────────────────────────
-# WRITE MESSAGE (to RAM + Supabase)
-# ─────────────────────────────────────────
-
 def add_message(agent: str, user_id: str, role: str, content: str):
     """
-    Adds a message to both:
-    1. RAM cache (instant — used for next Groq call)
-    2. Supabase (permanent — survives restarts)
-
-    The Supabase write happens in a background thread
-    so Riley never pauses waiting for the database.
+    Write to RAM immediately.
+    Write to Supabase in background thread.
     """
-    # Step 1 — write to RAM immediately
     if agent not in conversation_cache:
         conversation_cache[agent] = {}
     if user_id not in conversation_cache[agent]:
@@ -91,8 +67,6 @@ def add_message(agent: str, user_id: str, role: str, content: str):
         "content": content
     })
 
-    # Step 2 — write to Supabase in background thread
-    # Riley continues without waiting for this
     def save_to_db():
         try:
             supabase.table("conversations").insert({
@@ -109,21 +83,11 @@ def add_message(agent: str, user_id: str, role: str, content: str):
     thread.start()
 
 
-# ─────────────────────────────────────────
-# CLEAR HISTORY (for /reset command)
-# ─────────────────────────────────────────
-
 def clear_history(agent: str, user_id: str):
-    """
-    Clears conversation history for a user.
-    Wipes RAM cache and deletes from Supabase.
-    Triggered when user types /reset in Slack DM.
-    """
-    # Clear RAM
+    """Wipes RAM and Supabase for this user."""
     if agent in conversation_cache:
         conversation_cache[agent][user_id] = []
 
-    # Clear Supabase
     try:
         supabase.table("conversations") \
             .delete() \
