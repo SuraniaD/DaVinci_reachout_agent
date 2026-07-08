@@ -1,30 +1,17 @@
-from duckduckgo_search import DDGS
+from ddgs import DDGS
 from interaction_log import log_action
 
 
 def research_business(business_name: str) -> str:
     """
-    Searches DuckDuckGo for a business name.
+    Searches the web for a business name.
     Returns a short text summary of the top results.
-
-    This summary is passed to riley.py so Groq can
-    personalise the outreach email with real facts
-    about the business — not generic filler.
-
-    Returns a string like:
-        "GreenLeaf Organics is a Bangalore-based organic
-         vegetable delivery company founded in 2019.
-         They recently expanded to Pune and serve 2,000+
-         households weekly..."
     """
     try:
         print(f"🔍 Researching: {business_name}...")
 
-        with DDGS() as ddgs:
-            results = list(ddgs.text(
-                business_name,
-                max_results=4
-            ))
+        # New ddgs API — no context manager, just call directly
+        results = DDGS().text(business_name, max_results=4)
 
         if not results:
             summary = (
@@ -39,8 +26,6 @@ def research_business(business_name: str) -> str:
             )
             return summary
 
-        # Combine top results into a readable paragraph
-        # Each result has a "title" and "body"
         parts = []
         for r in results:
             if r.get("body"):
@@ -48,11 +33,10 @@ def research_business(business_name: str) -> str:
 
         summary = "\n".join(parts)
 
-        # Log what we found
         log_action(
             action_type="research",
             business_name=business_name,
-            detail=summary[:300]  # log first 300 chars
+            detail=summary[:300]
         )
 
         print(f"✅ Research done — {len(results)} results found")

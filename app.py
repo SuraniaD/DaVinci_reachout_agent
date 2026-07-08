@@ -36,17 +36,6 @@ slack_client = WebClient(token=os.environ.get("RILEY_BOT_TOKEN"))
 
 # ─────────────────────────────────────────
 # APPROVAL FLOW STATE
-# Tracks who is waiting for approval
-# and what the pending result is
-#
-# Format:
-# {
-#   "slack_user_id": {
-#     "pending_result": { contact, draft, subject, body },
-#     "remaining_contacts": [ ... ],
-#     "stats": { sent, skipped, failed }
-#   }
-# }
 # ─────────────────────────────────────────
 
 approval_state = {}
@@ -57,20 +46,14 @@ approval_state = {}
 # ─────────────────────────────────────────
 
 def download_slack_file(file_info: dict) -> str:
-    """
-    Downloads a file uploaded to Slack.
-    Saves it to a temp file and returns the path.
-    """
+    import requests
     file_url  = file_info["url_private_download"]
     file_name = file_info["name"]
-
-    import requests
-    headers  = {
+    headers   = {
         "Authorization": f"Bearer {os.environ.get('RILEY_BOT_TOKEN')}"
     }
     response = requests.get(file_url, headers=headers)
-
-    suffix = ".csv" if file_name.endswith(".csv") else ".xlsx"
+    suffix   = ".csv" if file_name.endswith(".csv") else ".xlsx"
     with tempfile.NamedTemporaryFile(
         delete=False, suffix=suffix
     ) as tmp:
@@ -79,65 +62,85 @@ def download_slack_file(file_info: dict) -> str:
 
 
 # ─────────────────────────────────────────
-# HELPER — PROCESS NEXT CONTACT IN THE LIST
+# HELPER — PROCESS NEXT CONTACT
 # ─────────────────────────────────────────
 
 def process_next_contact(user_id: str, say):
     """
-    Picks the next contact from the remaining list,
-    processes it (research + draft), then either:
-    - Posts draft for approval (approval mode)
-    - Sends immediately (auto-send mode)
+    Runs in a background thread.
+    Picks next contact, researches, drafts,
+    then either sends or waits for approval.
     """
-    state     = approval_state.get(user_id)
-    remaining = state["remaining_contacts"]
-    stats     = state["stats"]
+    def _run():
+        if user_id not in approval_state:
+            return
 
-    # No more contacts — run is complete
-    if not remaining:
-        total = stats["sent"] + stats["skipped"] + stats["failed"]
-        say(generate_summary(
-            total=total,
-            sent=stats["sent"],
-            skipped=stats["skipped"],
-            failed=stats["failed"]
-        ))
-        del approval_state[user_id]
-        return
+        state     = approval_state[user_id]
+        remaining = state["remaining_contacts"]
+        stats     = state["stats"]
 
-    # Take the next contact off the list
-    contact = remaining.pop(0)
-
-    # Research + draft
-    result = process_contact(user_id, contact, say)
-
-    if result is None:
-        # Something went wrong — skip and move on
-        stats["failed"] += 1
-        process_next_contact(user_id, say)
-        return
-
-    if is_auto_mode(user_id):
-        # AUTO-SEND — send immediately
-        success = send_approved_email(result)
-        if success:
-            stats["sent"] += 1
-            say(
-                f"✅ Sent to *{contact['name']}* "
-                f"at *{contact['business_name']}*"
+        # No more contacts — done
+        if not remaining:
+            total = (
+                stats["sent"] +
+                stats["skipped"] +
+                stats["failed"]
             )
-        else:
+            say(generate_summary(
+                total=total,
+                sent=stats["sent"],
+                skipped=stats["skipped"],
+                failed=stats["failed"]
+            ))
+            del approval_state[user_id]
+            return
+
+        # Take the next contact
+        contact = remaining.pop(0)
+
+        # Research + draft
+        result = process_contact(user_id, contact, say)
+
+        if result is None:
             stats["failed"] += 1
-            say(
-                f"❌ Failed to send to *{contact['name']}*. "
-                f"Moving on."
+            t = threading.Thread(
+                target=process_next_contact,
+                args=(user_id, say)
             )
-        process_next_contact(user_id, say)
+            t.daemon = True
+            t.start()
+            return
 
-    else:
-        # APPROVAL MODE — post draft and wait
-        state["pending_result"] = result
-        say(format_draft_for_slack(result))
+        if is_auto_mode(user_id):
+            # AUTO-SEND
+            success = send_approved_email(result)
+            if success:
+                stats["sent"] += 1
+                say(
+                    f"✅ Sent to *{contact['name']}* "
+                    f"at *{contact['business_name']}*"
+                )
+            else:
+                stats["failed"] += 1
+                say(
+                    f"❌ Failed to send to "
+                    f"*{contact['name']}*. Moving on."
+                )
+            t = threading.Thread(
+                target=process_next_contact,
+                args=(user_id, say)
+            )
+            t.daemon = True
+            t.start()
+
+        else:
+            # APPROVAL MODE — post draft and wait
+            state["pending_result"] = result
+            say(format_draft_for_slack(result))
+
+    thread = threading.Thread(target=_run)
+    thread.daemon = True
+    thread.start()
 
 
 # ─────────────────────────────────────────
@@ -145,10 +148,6 @@ def process_next_contact(user_id: str, say):
 # ─────────────────────────────────────────
 
 def handle_file_upload(event: dict, say, user_id: str):
-    """
-    Handles a CSV/Excel file upload from Slack.
-    Downloads the file, reads contacts, starts outreach run.
-    """
     file_info = event["files"][0]
     file_name = file_info.get("name", "")
 
@@ -218,15 +217,11 @@ def handle_file_upload(event: dict, say, user_id: str):
 
 @app.event("message")
 def handle_dm(event, say):
-    """
-    Central handler for all DM messages.
-    Runs every time you send Riley a message.
-    """
-    # Ignore bot messages — prevents infinite loops
+    # Ignore bot messages
     if event.get("bot_id"):
         return
 
-    # Only handle direct messages
+    # Only handle DMs
     if event.get("channel_type") != "im":
         return
 
@@ -240,7 +235,6 @@ def handle_dm(event, say):
 
     # ── COMMANDS ─────────────────────────────
 
-    # !reset — clear conversation memory
     if text.lower() == "!reset":
         clear_history("riley", user_id)
         say(
@@ -249,14 +243,12 @@ def handle_dm(event, say):
         )
         return
 
-    # !status — show recent activity log
     if text.lower() == "!status":
         logs      = get_recent_logs(limit=15)
         formatted = format_logs_for_slack(logs)
         say(formatted)
         return
 
-    # !automode on — switch to auto-send
     if text.lower() == "!automode on":
         set_auto_mode(user_id, True)
         say(
@@ -266,7 +258,6 @@ def handle_dm(event, say):
         )
         return
 
-    # !automode off — switch to approval mode
     if text.lower() == "!automode off":
         set_auto_mode(user_id, False)
         say(
@@ -275,8 +266,7 @@ def handle_dm(event, say):
         )
         return
 
-    # ── APPROVAL FLOW RESPONSES ───────────────
-    # You're in the middle of an outreach run
+    # ── APPROVAL FLOW ─────────────────────────
 
     if user_id in approval_state and \
        approval_state[user_id].get("pending_result"):
@@ -285,7 +275,6 @@ def handle_dm(event, say):
         result = state["pending_result"]
         stats  = state["stats"]
 
-        # APPROVE — send this email
         if text.lower() == "approve":
             state["pending_result"] = None
             success = send_approved_email(result)
@@ -299,13 +288,10 @@ def handle_dm(event, say):
                 )
             else:
                 stats["failed"] += 1
-                say(
-                    "❌ Send failed. Moving to next contact..."
-                )
+                say("❌ Send failed. Moving to next contact...")
             process_next_contact(user_id, say)
             return
 
-        # SKIP — don't send this email
         if text.lower() == "skip":
             state["pending_result"] = None
             skip_contact(result)
@@ -318,22 +304,20 @@ def handle_dm(event, say):
             process_next_contact(user_id, say)
             return
 
-        # EDIT INSTRUCTIONS — redraft with feedback
+        # Edit instructions — redraft
         say("Got it — redrafting with your feedback...")
         contact = result["contact"]
 
         from agents.riley import draft_outreach_email, parse_draft
-        from tools.research import research_business
 
         try:
-            research = research_business(contact["business_name"])
             feedback_task = (
                 f"The CEO gave this feedback on the draft: "
                 f'"{text}"\n\n'
                 f"Original draft:\n{result['draft']}\n\n"
                 f"Please redraft incorporating the feedback."
             )
-            new_draft = chat_with_riley(user_id, feedback_task)
+            new_draft           = chat_with_riley(user_id, feedback_task)
             new_subject, new_body = parse_draft(new_draft)
 
             state["pending_result"] = {
@@ -365,16 +349,12 @@ def handle_dm(event, say):
 
 if __name__ == "__main__":
     print("🚀 Riley is starting up...")
-
     print("📚 Loading conversation history from Supabase...")
     load_all_conversations()
-
     print("🤖 Connecting to Slack...")
-
     handler = SocketModeHandler(
         app,
         os.environ.get("RILEY_APP_TOKEN")
     )
-
     print("✅ Riley is live. DM Riley in Slack to start.")
     handler.start()

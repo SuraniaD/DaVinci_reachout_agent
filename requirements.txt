@@ -4,5 +4,5 @@ python-dotenv
 supabase
 pandas
 openpyxl
-duckduckgo-search
+ddgs
 requests
