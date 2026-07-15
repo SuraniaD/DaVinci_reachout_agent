@@ -4,8 +4,15 @@ from interaction_log import log_action
 
 def research_business(business_name: str) -> str:
     """
-    Searches DuckDuckGo for a business.
-    Returns a text summary used to personalise the email.
+    Searches DuckDuckGo for a business name.
+    Returns a text summary capped at 800 characters.
+
+    Cap reason: first 800 chars contain the most
+    useful facts. Extra length costs tokens in the
+    Groq draft call with minimal quality improvement.
+
+    No LLM call here — pure web search.
+    Zero tokens spent in this function.
     """
     try:
         print(f"🔍 Researching: {business_name}...")
@@ -30,7 +37,8 @@ def research_business(business_name: str) -> str:
             if r.get("body"):
                 parts.append(f"{r['title']}: {r['body']}")
 
-        summary = "\n".join(parts)
+        # Cap at 800 characters — ~200 tokens
+        summary = "\n".join(parts)[:800]
 
         log_action(
             action_type="research",
