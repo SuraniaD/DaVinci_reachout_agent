@@ -19,12 +19,16 @@ from outreach_runner import (
     set_auto_mode
 )
 from tools.file_reader import read_contact_list
-from interaction_log import log_action, get_recent_logs, format_logs_for_slack
+from interaction_log import (
+    log_action,
+    get_recent_logs,
+    format_logs_for_slack
+)
 
 load_dotenv()
 
 # ─────────────────────────────────────────
-# INITIALISE SLACK BOLT APP
+# SLACK APP
 # ─────────────────────────────────────────
 
 app = App(
@@ -32,25 +36,42 @@ app = App(
     signing_secret=os.environ.get("RILEY_SIGNING_SECRET")
 )
 
-slack_client = WebClient(token=os.environ.get("RILEY_BOT_TOKEN"))
+slack_client = WebClient(
+    token=os.environ.get("RILEY_BOT_TOKEN")
+)
 
 # ─────────────────────────────────────────
-# APPROVAL FLOW STATE
+# APPROVAL STATE
+# Tracks pending drafts and remaining contacts
+# per user — stored in RAM
+#
+# Structure:
+# {
+#   "slack_user_id": {
+#     "pending_result":     None or { contact, draft, subject, body }
+#     "remaining_contacts": [ ... ]
+#     "stats":              { sent, skipped, failed }
+#     "waiting":            True/False — is Riley waiting for your reply?
+#   }
+# }
 # ─────────────────────────────────────────
 
 approval_state = {}
 
 
 # ─────────────────────────────────────────
-# HELPER — DOWNLOAD FILE FROM SLACK
+# DOWNLOAD FILE FROM SLACK
 # ─────────────────────────────────────────
 
 def download_slack_file(file_info: dict) -> str:
+    """Downloads uploaded file from Slack to a temp file."""
     import requests
-    file_url = file_info["url_private_download"]
+    file_url  = file_info["url_private_download"]
     file_name = file_info["name"]
-    headers  = {
-        "Authorization": f"Bearer {os.environ.get('RILEY_BOT_TOKEN')}"
+    headers   = {
+        "Authorization": (
+            f"Bearer {os.environ.get('RILEY_BOT_TOKEN')}"
+        )
     }
     response = requests.get(file_url, headers=headers)
     suffix   = ".csv" if file_name.endswith(".csv") else ".xlsx"
@@ -62,14 +83,40 @@ def download_slack_file(file_info: dict) -> str:
 
 
 # ─────────────────────────────────────────
-# HELPER — PROCESS NEXT CONTACT
+# POST DRAFT AND WAIT FOR APPROVAL
+# Called after each draft is ready
+# Sets waiting=True so handle_dm knows
+# the next message is an approval reply
+# ─────────────────────────────────────────
+
+def post_draft_for_approval(user_id: str, result: dict, say):
+    """
+    Posts the draft to Slack and marks state as waiting.
+    handle_dm checks the waiting flag to route replies
+    to the approval handler instead of general chat.
+    """
+    if user_id not in approval_state:
+        return
+
+    # Store the pending result
+    approval_state[user_id]["pending_result"] = result
+    # Set waiting flag — critical for approval routing
+    approval_state[user_id]["waiting"] = True
+
+    # Post the draft
+    say(format_draft_for_slack(result))
+
+
+# ─────────────────────────────────────────
+# PROCESS NEXT CONTACT
+# Always runs in a new background thread
 # ─────────────────────────────────────────
 
 def process_next_contact(user_id: str, say):
     """
-    Always runs in a background thread.
-    Picks next contact, researches, drafts,
-    then either sends or waits for approval.
+    Picks next contact, researches, drafts.
+    Either posts for approval or auto-sends.
+    Runs in background thread — never blocks Slack.
     """
     def _run():
         if user_id not in approval_state:
@@ -79,6 +126,7 @@ def process_next_contact(user_id: str, say):
         remaining = state["remaining_contacts"]
         stats     = state["stats"]
 
+        # No more contacts — run complete
         if not remaining:
             total = (
                 stats["sent"] +
@@ -94,10 +142,14 @@ def process_next_contact(user_id: str, say):
             del approval_state[user_id]
             return
 
+        # Take next contact off the list
         contact = remaining.pop(0)
-        result  = process_contact(user_id, contact, say)
+
+        # Research + draft
+        result = process_contact(user_id, contact, say)
 
         if result is None:
+            # Something went wrong — move on
             stats["failed"] += 1
             t = threading.Thread(
                 target=process_next_contact,
@@ -108,6 +160,7 @@ def process_next_contact(user_id: str, say):
             return
 
         if is_auto_mode(user_id):
+            # AUTO-SEND — send immediately, no approval
             success = send_approved_email(result)
             if success:
                 stats["sent"] += 1
@@ -121,6 +174,7 @@ def process_next_contact(user_id: str, say):
                     f"❌ Failed to send to "
                     f"*{contact['name']}*. Moving on."
                 )
+            # Move to next contact
             t = threading.Thread(
                 target=process_next_contact,
                 args=(user_id, say)
@@ -129,8 +183,10 @@ def process_next_contact(user_id: str, say):
             t.start()
 
         else:
-            state["pending_result"] = result
-            say(format_draft_for_slack(result))
+            # APPROVAL MODE — post draft and wait
+            # Uses post_draft_for_approval which sets
+            # the waiting flag so handle_dm routes correctly
+            post_draft_for_approval(user_id, result, say)
 
     thread = threading.Thread(target=_run)
     thread.daemon = True
@@ -142,6 +198,7 @@ def process_next_contact(user_id: str, say):
 # ─────────────────────────────────────────
 
 def handle_file_upload(event: dict, say, user_id: str):
+    """Handles CSV/Excel upload — reads contacts, starts run."""
     file_info = event["files"][0]
     file_name = file_info.get("name", "")
 
@@ -162,7 +219,10 @@ def handle_file_upload(event: dict, say, user_id: str):
         contacts  = read_contact_list(file_path, user_id)
 
         if not contacts:
-            say("⚠️ The file was empty or had no valid contacts.")
+            say(
+                "⚠️ The file was empty or "
+                "had no valid contacts."
+            )
             return
 
         mode_msg = (
@@ -182,9 +242,11 @@ def handle_file_upload(event: dict, say, user_id: str):
             f"to switch modes at any time._"
         )
 
+        # Initialise approval state for this user
         approval_state[user_id] = {
             "pending_result":     None,
             "remaining_contacts": contacts,
+            "waiting":            False,
             "stats": {
                 "sent":    0,
                 "skipped": 0,
@@ -192,13 +254,14 @@ def handle_file_upload(event: dict, say, user_id: str):
             }
         }
 
+        # Start the outreach loop
         process_next_contact(user_id, say)
 
     except ValueError as e:
         say(f"⚠️ Problem with your file: {e}")
 
     except Exception as e:
-        say(f"❌ Something went wrong reading the file: {e}")
+        say(f"❌ Something went wrong: {e}")
         log_action(
             action_type="error",
             detail=f"File upload error: {str(e)}"
@@ -206,25 +269,144 @@ def handle_file_upload(event: dict, say, user_id: str):
 
 
 # ─────────────────────────────────────────
-# MAIN EVENT HANDLER
+# HANDLE APPROVAL REPLY
+# Separated from handle_dm for clarity
+# Called when waiting=True and user sends a message
+# ─────────────────────────────────────────
+
+def handle_approval_reply(
+    user_id: str,
+    text:    str,
+    say
+):
+    """
+    Handles your reply when Riley is waiting for approval.
+    Three cases:
+      "approve" → send the email
+      "skip"    → skip this contact
+      anything else → treat as edit instructions, redraft
+    """
+    state  = approval_state[user_id]
+    result = state["pending_result"]
+    stats  = state["stats"]
+
+    # Clear waiting flag immediately
+    # So if redraft fails, user isn't stuck
+    state["waiting"] = False
+    state["pending_result"] = None
+
+    # ── APPROVE ──────────────────────────
+    if text.lower() == "approve":
+        success = send_approved_email(result)
+        if success:
+            stats["sent"] += 1
+            contact = result["contact"]
+            say(
+                f"✅ Sent to *{contact['name']}* "
+                f"at *{contact['business_name']}*. "
+                f"Moving to next contact..."
+            )
+        else:
+            stats["failed"] += 1
+            say(
+                "❌ Send failed. "
+                "Moving to next contact..."
+            )
+        process_next_contact(user_id, say)
+        return
+
+    # ── SKIP ─────────────────────────────
+    if text.lower() == "skip":
+        skip_contact(result)
+        stats["skipped"] += 1
+        contact = result["contact"]
+        say(
+            f"⏭️ Skipped *{contact['name']}*. "
+            f"Moving to next contact..."
+        )
+        process_next_contact(user_id, say)
+        return
+
+    # ── EDIT INSTRUCTIONS ────────────────
+    # Anything else = feedback to redraft with
+    say("Got it — redrafting with your feedback...")
+    contact = result["contact"]
+
+    from agents.riley import (
+        chat_with_riley,
+        parse_draft
+    )
+
+    try:
+        feedback_task = (
+            f"The CEO gave this feedback on the draft: "
+            f'"{text}"\n\n'
+            f"Original draft:\n{result['draft']}\n\n"
+            f"Please redraft incorporating this feedback."
+        )
+        new_draft             = chat_with_riley(
+            user_id, feedback_task
+        )
+        new_subject, new_body = parse_draft(new_draft)
+
+        new_result = {
+            "contact": contact,
+            "draft":   new_draft,
+            "subject": new_subject,
+            "body":    new_body
+        }
+
+        # Post new draft and wait again
+        post_draft_for_approval(user_id, new_result, say)
+
+    except Exception as e:
+        say(
+            f"⚠️ Redraft failed: {e}. \n"
+            f"Reply *approve* to send the original "
+            f"or *skip* to skip this contact."
+        )
+        # Restore original result so approve/skip still work
+        state["pending_result"] = result
+        state["waiting"]        = True
+
+
+# ─────────────────────────────────────────
+# MAIN MESSAGE HANDLER
 # ─────────────────────────────────────────
 
 @app.event("message")
 def handle_dm(event, say):
+    """
+    Central handler for all Slack DMs.
+    Routes to correct function based on content and state.
+
+    Routing order:
+    1. Ignore bot messages
+    2. Only handle DMs
+    3. File upload → handle_file_upload
+    4. Commands → handle directly
+    5. Waiting for approval → handle_approval_reply
+    6. General chat → chat_with_riley
+    """
+    # Ignore bot messages — prevents infinite loops
     if event.get("bot_id"):
         return
+
+    # Only handle direct messages
     if event.get("channel_type") != "im":
         return
 
     user_id = event["user"]
     text    = event.get("text", "").strip()
 
-    # FILE UPLOAD
+    # ── FILE UPLOAD ──────────────────────
     if event.get("files"):
         handle_file_upload(event, say, user_id)
         return
 
-    # COMMANDS
+    # ── COMMANDS ─────────────────────────
+    # Commands work even during an outreach run
+
     if text.lower() == "!reset":
         clear_history("riley", user_id)
         say(
@@ -242,8 +424,8 @@ def handle_dm(event, say):
     if text.lower() == "!automode on":
         set_auto_mode(user_id, True)
         say(
-            "⚡ *Auto-send mode ON* — I'll send emails "
-            "immediately without asking for approval. "
+            "⚡ *Auto-send mode ON* — emails go out "
+            "immediately without approval. "
             "Type *!automode off* to switch back."
         )
         return
@@ -251,82 +433,22 @@ def handle_dm(event, say):
     if text.lower() == "!automode off":
         set_auto_mode(user_id, False)
         say(
-            "✋ *Approval mode ON* — I'll show you each "
-            "draft and wait for your approval before sending."
+            "✋ *Approval mode ON* — I'll show you "
+            "each draft before sending."
         )
         return
 
-    # APPROVAL FLOW
+    # ── APPROVAL FLOW ────────────────────
+    # Check the waiting flag — much more reliable
+    # than checking pending_result which can be
+    # None momentarily due to threading timing
+
     if user_id in approval_state and \
-       approval_state[user_id].get("pending_result"):
-
-        state  = approval_state[user_id]
-        result = state["pending_result"]
-        stats  = state["stats"]
-
-        if text.lower() == "approve":
-            state["pending_result"] = None
-            success = send_approved_email(result)
-            if success:
-                stats["sent"] += 1
-                contact = result["contact"]
-                say(
-                    f"✅ Sent to *{contact['name']}* "
-                    f"at *{contact['business_name']}*. "
-                    f"Moving to next contact..."
-                )
-            else:
-                stats["failed"] += 1
-                say("❌ Send failed. Moving to next contact...")
-            process_next_contact(user_id, say)
-            return
-
-        if text.lower() == "skip":
-            state["pending_result"] = None
-            skip_contact(result)
-            stats["skipped"] += 1
-            contact = result["contact"]
-            say(
-                f"⏭️ Skipped *{contact['name']}*. "
-                f"Moving to next contact..."
-            )
-            process_next_contact(user_id, say)
-            return
-
-        # Edit instructions
-        say("Got it — redrafting with your feedback...")
-        contact = result["contact"]
-
-        from agents.riley import draft_outreach_email, parse_draft
-
-        try:
-            feedback_task = (
-                f"The CEO gave this feedback on the draft: "
-                f'"{text}"\n\n'
-                f"Original draft:\n{result['draft']}\n\n"
-                f"Please redraft incorporating the feedback."
-            )
-            new_draft             = chat_with_riley(user_id, feedback_task)
-            new_subject, new_body = parse_draft(new_draft)
-
-            state["pending_result"] = {
-                "contact": contact,
-                "draft":   new_draft,
-                "subject": new_subject,
-                "body":    new_body
-            }
-
-            say(format_draft_for_slack(state["pending_result"]))
-
-        except Exception as e:
-            say(
-                f"⚠️ Redraft failed: {e}. "
-                f"Reply *approve* to send original "
-                f"or *skip* to skip this contact."
-            )
+       approval_state[user_id].get("waiting"):
+        handle_approval_reply(user_id, text, say)
         return
 
-    # GENERAL CHAT
+    # ── GENERAL CHAT ─────────────────────
     say("_Thinking..._")
     reply = chat_with_riley(user_id, text)
     say(reply)
