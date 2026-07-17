@@ -16,6 +16,52 @@ FROM_NAME      = os.environ.get(
 )
 
 
+def _text_to_html(body: str) -> str:
+    """
+    Converts plain text email body to clean HTML.
+    Preserves line breaks and renders any HTML links
+    that Riley included (e.g. <a href="...">...</a>).
+    """
+    # Split into paragraphs on double newlines
+    paragraphs = body.strip().split("\n\n")
+
+    html_parts = []
+    for para in paragraphs:
+        # Convert single newlines within paragraph to <br>
+        para_html = para.replace("\n", "<br>")
+        html_parts.append(f"<p>{para_html}</p>")
+
+    body_html = "\n".join(html_parts)
+
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    body {{
+      font-family: Arial, sans-serif;
+      font-size: 15px;
+      line-height: 1.6;
+      color: #222222;
+      max-width: 600px;
+      margin: 0 auto;
+      padding: 20px;
+    }}
+    p {{
+      margin: 0 0 16px 0;
+    }}
+    a {{
+      color: #0066cc;
+      text-decoration: underline;
+    }}
+  </style>
+</head>
+<body>
+{body_html}
+</body>
+</html>"""
+
+
 def send_email(
     to_email:      str,
     subject:       str,
@@ -24,38 +70,41 @@ def send_email(
     business_name: str = None
 ) -> bool:
     """
-    Sends email via Resend API.
-    Logs full response to Railway so we can see exactly
-    what Resend returns — helps diagnose silent failures.
+    Sends email via Resend API as HTML.
+    Converts Riley's plain text body to HTML
+    so hyperlinks in the sign off and CTA render.
     """
     try:
-        print(f"📧 [EMAIL] Attempting to send to {to_email}")
+        print(f"📧 [EMAIL] Sending to {to_email}...")
         print(f"📧 [EMAIL] From: {FROM_NAME} <{FROM_EMAIL}>")
         print(f"📧 [EMAIL] Subject: {subject}")
-        print(f"📧 [EMAIL] Resend API key set: {bool(resend.api_key)}")
+
+        html_body = _text_to_html(body)
 
         params = {
             "from":    f"{FROM_NAME} <{FROM_EMAIL}>",
             "to":      [to_email],
             "subject": subject,
+            "html":    html_body,
+            # Plain text fallback for email clients
+            # that don't render HTML
             "text":    body
         }
 
         print(f"📧 [EMAIL] Sending via Resend...")
         response = resend.Emails.send(params)
+        print(f"📧 [EMAIL] Full response: {response}")
 
-        # Log the FULL response so we can see exactly
-        # what Resend returned
-        print(f"📧 [EMAIL] Full Resend response: {response}")
-
-        # Check response has an ID
-        email_id = response.get("id") if isinstance(response, dict) else getattr(response, "id", None)
+        email_id = (
+            response.get("id")
+            if isinstance(response, dict)
+            else getattr(response, "id", None)
+        )
 
         if email_id:
             print(
                 f"✅ [EMAIL] Accepted by Resend — "
-                f"ID: {email_id} — "
-                f"check Resend dashboard for delivery status"
+                f"ID: {email_id}"
             )
             _record_outreach(
                 contact_name=contact_name,
@@ -74,7 +123,7 @@ def send_email(
             return True
         else:
             print(
-                f"❌ [EMAIL] Resend returned no ID — "
+                f"❌ [EMAIL] No ID returned — "
                 f"response: {response}"
             )
             _record_outreach(
@@ -89,13 +138,13 @@ def send_email(
                 action_type="error",
                 contact_name=contact_name,
                 business_name=business_name,
-                detail=f"Resend returned no ID: {response}"
+                detail=f"No ID: {response}"
             )
             return False
 
     except Exception as e:
-        print(f"❌ [EMAIL] Exception during send: {e}")
-        print(f"❌ [EMAIL] Exception type: {type(e).__name__}")
+        print(f"❌ [EMAIL] Exception: {e}")
+        print(f"❌ [EMAIL] Type: {type(e).__name__}")
 
         _record_outreach(
             contact_name=contact_name,
@@ -109,7 +158,7 @@ def send_email(
             action_type="error",
             contact_name=contact_name,
             business_name=business_name,
-            detail=f"Send exception: {str(e)}"
+            detail=f"Exception: {str(e)}"
         )
         return False
 
@@ -136,7 +185,7 @@ def record_skipped(
         business_name=business_name,
         detail=f"Skipped {email_address}"
     )
-    print(f"⏭️ Skipped {contact_name} at {business_name}")
+    print(f"⏭️  Skipped {contact_name} @ {business_name}")
 
 
 def _record_outreach(
@@ -158,9 +207,11 @@ def _record_outreach(
             "status":        status
         }
         if status == "sent":
-            row["sent_at"] = datetime.now(timezone.utc).isoformat()
+            row["sent_at"] = datetime.now(
+                timezone.utc
+            ).isoformat()
 
         supabase.table("outreach_records").insert(row).execute()
 
     except Exception as e:
-        print(f"⚠️ [DB] Could not record outreach: {e}")
+        print(f"⚠️  [DB] Could not record outreach: {e}")
