@@ -35,17 +35,33 @@ COMMANDS:
 - !automode off → confirm approval mode is on
 """
 
+# ─────────────────────────────────────────
+# DAILY TOKEN LIMIT
+# llama-3.1-8b-instant free tier = 500k/day
+# Update this if you switch models
+# ─────────────────────────────────────────
+
+DAILY_TOKEN_LIMIT = 500_000
+
+# Running session total — resets on restart
+session_tokens_used = 0
+
 
 # ─────────────────────────────────────────
 # GROQ CALL WITH RETRY
-# Retries once after 60s on rate limit
+# Returns (content, tokens_used) tuple
 # ─────────────────────────────────────────
 
 def _call_groq_with_retry(
     messages:    list,
     max_tokens:  int,
     temperature: float
-) -> str:
+) -> tuple[str, int]:
+    """
+    Calls Groq with one automatic retry on rate limit.
+    Waits 60 seconds before retrying.
+    Returns (reply_text, tokens_used_this_call).
+    """
     for attempt in range(2):
         try:
             response = client.chat.completions.create(
@@ -54,7 +70,15 @@ def _call_groq_with_retry(
                 max_tokens=max_tokens,
                 temperature=temperature
             )
-            return response.choices[0].message.content
+
+            content     = response.choices[0].message.content
+            tokens_used = response.usage.total_tokens
+
+            print(
+                f"🔢 [TOKENS] This call: {tokens_used} tokens"
+            )
+
+            return content, tokens_used
 
         except Exception as e:
             if "rate_limit_exceeded" in str(e) and attempt == 0:
@@ -62,6 +86,49 @@ def _call_groq_with_retry(
                 time.sleep(60)
                 continue
             raise e
+
+
+# ─────────────────────────────────────────
+# TOKEN FOOTER
+# Appended to every Slack chat reply
+# Shows % used and % remaining today
+# ─────────────────────────────────────────
+
+def _token_footer(tokens_this_call: int) -> str:
+    """
+    Builds a token usage line appended to every Slack reply.
+    Shows percentage used and remaining — not absolute numbers.
+    Session total resets on Railway restart.
+    """
+    global session_tokens_used
+    session_tokens_used += tokens_this_call
+
+    pct_used      = (session_tokens_used / DAILY_TOKEN_LIMIT) * 100
+    pct_remaining = 100 - pct_used
+
+    # Cap at boundaries
+    pct_used      = min(pct_used, 100)
+    pct_remaining = max(pct_remaining, 0)
+
+    # Colour indicator based on remaining
+    if pct_remaining > 20:
+        indicator = "🟢"
+    elif pct_remaining > 6:
+        indicator = "🟡"
+    else:
+        indicator = "🔴"
+
+    # Visual bar — 10 blocks wide
+    filled = int(pct_used / 10)
+    bar    = "█" * filled + "░" * (10 - filled)
+
+    return (
+        f"\n\n"
+        f"─────────────────────\n"
+        f"{indicator} `{bar}` "
+        f"{pct_used:.1f}% used · "
+        f"{pct_remaining:.1f}% remaining today"
+    )
 
 
 # ─────────────────────────────────────────
@@ -77,9 +144,9 @@ def _load_skill(filename: str) -> str:
     Loaded on demand — never loaded unless that task runs.
 
     Current skills:
-      email_template.txt  → email drafting rules
-      (future) strategy_template.txt  → targeting advice
-      (future) followup_template.txt  → follow-up emails
+      email_template.txt          → email drafting rules
+      (future) strategy_template.txt   → targeting advice
+      (future) followup_template.txt   → follow-up emails
     """
     skill_path = os.path.join(
         os.path.dirname(__file__),
@@ -108,6 +175,7 @@ BODY:
 # GENERAL CHAT
 # Sends: core identity + history + new message
 # Does NOT load any skill files
+# Appends token footer to every reply
 # ─────────────────────────────────────────
 
 def chat_with_riley(user_id: str, user_message: str) -> str:
@@ -115,6 +183,7 @@ def chat_with_riley(user_id: str, user_message: str) -> str:
     General conversation with Riley.
     Only RILEY_SYSTEM_PROMPT sent as system message.
     No email rules, no strategy rules — chat only.
+    Token footer appended to every Slack reply.
     """
     history = get_history("riley", user_id)
     add_message("riley", user_id, "user", user_message)
@@ -122,19 +191,27 @@ def chat_with_riley(user_id: str, user_message: str) -> str:
     messages = history + [{"role": "user", "content": user_message}]
 
     try:
-        reply = _call_groq_with_retry(
+        reply, tokens_used = _call_groq_with_retry(
             messages=[
                 {"role": "system", "content": RILEY_SYSTEM_PROMPT}
             ] + messages,
             max_tokens=500,
             temperature=0.7
         )
+
+        # Save raw reply to memory — without footer
+        # so footer doesn't bloat future history
         add_message("riley", user_id, "assistant", reply)
-        return reply
+
+        # Return reply with token footer for Slack display
+        return reply + _token_footer(tokens_used)
 
     except Exception as e:
         print(f"❌ Groq chat error: {e}")
-        return f"Sorry, hit an error: {e}. Try again in a moment."
+        return (
+            f"Sorry, hit an error: {e}. "
+            f"Try again in a moment."
+        )
 
 
 # ─────────────────────────────────────────
@@ -152,20 +229,15 @@ def draft_outreach_email(
 ) -> str:
     """
     Drafts a personalised outreach email.
+    Uses email_template.txt as system prompt.
 
-    What gets sent to Groq:
-      system → email_template.txt (email rules only, ~280 tokens)
-      user   → contact details + research capped at 800 chars
-
-    What does NOT get sent:
-      - Conversation history (not needed for drafting)
-      - RILEY_SYSTEM_PROMPT (chat rules irrelevant here)
+    Token footer NOT added to draft text itself —
+    the draft goes into the approval message in Slack.
+    Token usage is logged to Railway and added to
+    session total so % remaining stays accurate.
     """
-    # Load email skill — only at draft time
     email_skill = _load_skill("email_template.txt")
 
-    # Cap research at 800 chars — first 800 chars
-    # have the most useful facts, rest rarely helps
     task = f"""Contact name:  {contact_name}
 Business name: {business_name}
 
@@ -180,7 +252,7 @@ Research:
     )
 
     try:
-        draft = _call_groq_with_retry(
+        draft, tokens_used = _call_groq_with_retry(
             messages=[
                 {"role": "system", "content": email_skill},
                 {"role": "user",   "content": task}
@@ -188,7 +260,20 @@ Research:
             max_tokens=400,
             temperature=0.8
         )
-        # Save draft to memory so CEO can reference it
+
+        # Update session total so % remaining stays accurate
+        # even though footer not shown for drafts
+        global session_tokens_used
+        session_tokens_used += tokens_used
+
+        print(
+            f"✍️  [DRAFT] {contact_name} @ {business_name} "
+            f"— {tokens_used} tokens · "
+            f"{((session_tokens_used / DAILY_TOKEN_LIMIT) * 100):.1f}% "
+            f"of daily limit used"
+        )
+
+        # Save draft to memory
         add_message("riley", user_id, "assistant", draft)
         return draft
 
@@ -204,10 +289,8 @@ Research:
 
 def parse_draft(draft: str) -> tuple[str, str]:
     """
-    Takes Riley's raw draft response and splits it
-    into a subject line and email body.
-
-    Handles variations in capitalisation and spacing.
+    Splits Riley's raw draft response into
+    subject line and email body.
     Falls back gracefully if format is unexpected.
     """
     lines      = draft.strip().split("\n")
