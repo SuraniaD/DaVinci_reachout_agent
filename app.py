@@ -82,7 +82,6 @@ def download_slack_file(file_info: dict) -> str:
 
 # ─────────────────────────────────────────
 # INITIALISE OUTREACH RUN
-# Shared by file upload and pasted table
 # ─────────────────────────────────────────
 
 def start_outreach_run(
@@ -91,13 +90,13 @@ def start_outreach_run(
     say
 ):
     """
-    Initialises approval state and starts the outreach loop.
-    Called after contacts loaded from any source —
-    file upload or pasted table.
+    Initialises approval state and starts the loop.
+    Default mode is APPROVAL — never auto-sends
+    unless you explicitly switch with !automode on.
     """
     print(
-        f"🚀 [OUTREACH RUN] Starting run for user {user_id} "
-        f"— {len(contacts)} contacts"
+        f"🚀 [OUTREACH RUN] Starting for {user_id} — "
+        f"{len(contacts)} contacts"
     )
 
     mode = "AUTO-SEND" if is_auto_mode(user_id) else "APPROVAL"
@@ -109,7 +108,8 @@ def start_outreach_run(
         if is_auto_mode(user_id)
         else
         "✋ *Approval mode is ON* — "
-        "I'll show you each draft before sending."
+        "I'll show you each draft and wait for your "
+        "*approve* or *skip* before doing anything."
     )
 
     say(
@@ -120,9 +120,11 @@ def start_outreach_run(
         f"to switch modes at any time._"
     )
 
+    # Initialise state — waiting starts as False
+    # It gets set to True only when a draft is posted
     approval_state[user_id] = {
         "pending_result":     None,
-        "remaining_contacts": contacts,
+        "remaining_contacts": list(contacts),
         "waiting":            False,
         "stats": {
             "sent":    0,
@@ -131,6 +133,11 @@ def start_outreach_run(
         }
     }
 
+    print(
+        f"✅ [OUTREACH RUN] State initialised for {user_id}"
+    )
+
+    # Kick off the first contact
     process_next_contact(user_id, say)
 
 
@@ -145,26 +152,36 @@ def post_draft_for_approval(
 ):
     """
     Posts the draft to Slack and sets waiting=True.
-    handle_dm checks waiting flag to route replies
-    to approval handler instead of general chat.
+    This is the ONLY place waiting gets set to True.
+    handle_dm checks this flag to route replies
+    to the approval handler.
     """
     if user_id not in approval_state:
         print(
-            f"⚠️  [APPROVAL] approval_state missing "
-            f"for {user_id} — cannot post draft"
+            f"⚠️  [APPROVAL] No state for {user_id} "
+            f"— cannot post draft"
         )
         return
 
+    # Store the result BEFORE posting to Slack
+    # so it's ready when the user replies
     approval_state[user_id]["pending_result"] = result
     approval_state[user_id]["waiting"]        = True
 
     contact = result["contact"]
     print(
-        f"✋ [APPROVAL] Posting draft for: "
-        f"{contact['name']} @ {contact['business_name']}"
+        f"✋ [APPROVAL] Waiting for approval: "
+        f"{contact['name']} @ {contact['business_name']}\n"
+        f"   waiting flag = True"
     )
 
+    # Post the draft — user sees this in Slack
     say(format_draft_for_slack(result))
+
+    print(
+        f"✋ [APPROVAL] Draft posted — "
+        f"waiting for approve/skip from {user_id}"
+    )
 
 
 # ─────────────────────────────────────────
@@ -175,14 +192,15 @@ def post_draft_for_approval(
 def process_next_contact(user_id: str, say):
     """
     Picks next contact, researches, drafts.
-    Either posts for approval or auto-sends.
+    In approval mode — posts draft and sets waiting=True.
+    In auto-send mode — sends immediately.
     Runs in background thread — never blocks Slack.
     """
     def _run():
         if user_id not in approval_state:
             print(
-                f"⚠️  [LOOP] approval_state cleared "
-                f"for {user_id} — stopping"
+                f"⚠️  [LOOP] No state for {user_id} "
+                f"— stopping"
             )
             return
 
@@ -192,16 +210,16 @@ def process_next_contact(user_id: str, say):
 
         print(
             f"📋 [LOOP] {len(remaining)} contacts remaining "
-            f"for user {user_id}"
+            f"for {user_id}"
         )
 
         # No more contacts — run complete
         if not remaining:
             print(
                 f"🏁 [LOOP] Run complete for {user_id} — "
-                f"sent: {stats['sent']}, "
-                f"skipped: {stats['skipped']}, "
-                f"failed: {stats['failed']}"
+                f"sent={stats['sent']} "
+                f"skipped={stats['skipped']} "
+                f"failed={stats['failed']}"
             )
             total = (
                 stats["sent"] +
@@ -217,7 +235,7 @@ def process_next_contact(user_id: str, say):
             del approval_state[user_id]
             return
 
-        # Take next contact off the list
+        # Take next contact
         contact = remaining.pop(0)
         print(
             f"▸  [LOOP] Processing: {contact['name']} "
@@ -230,8 +248,8 @@ def process_next_contact(user_id: str, say):
 
         if result is None:
             print(
-                f"❌ [LOOP] process_contact returned None "
-                f"for {contact['name']} — marking as failed"
+                f"❌ [LOOP] Failed for {contact['name']} "
+                f"— moving on"
             )
             stats["failed"] += 1
             t = threading.Thread(
@@ -243,9 +261,10 @@ def process_next_contact(user_id: str, say):
             return
 
         if is_auto_mode(user_id):
+            # AUTO-SEND MODE
             print(
-                f"⚡ [AUTO-SEND] Sending immediately to "
-                f"{contact['email']}"
+                f"⚡ [AUTO-SEND] Sending to "
+                f"{contact['email']}..."
             )
             success = send_approved_email(result)
             if success:
@@ -268,6 +287,7 @@ def process_next_contact(user_id: str, say):
                     f"❌ Failed to send to "
                     f"*{contact['name']}*. Moving on."
                 )
+            # Move to next contact
             t = threading.Thread(
                 target=process_next_contact,
                 args=(user_id, say)
@@ -276,6 +296,13 @@ def process_next_contact(user_id: str, say):
             t.start()
 
         else:
+            # APPROVAL MODE
+            # Post draft and set waiting=True
+            # The loop STOPS here until user replies
+            print(
+                f"✋ [LOOP] Approval mode — "
+                f"posting draft and waiting..."
+            )
             post_draft_for_approval(user_id, result, say)
 
     thread = threading.Thread(target=_run)
@@ -289,54 +316,71 @@ def process_next_contact(user_id: str, say):
 
 def handle_file_upload(event: dict, say, user_id: str):
     """
-    Handles CSV/Excel file uploaded to Slack DM.
-    Supports .csv, .xlsx, .xls
+    Handles CSV/Excel uploaded to Slack DM.
+    read_contact_list returns (contacts, skipped) tuple.
     """
     file_info = event["files"][0]
     file_name = file_info.get("name", "")
 
     print(
-        f"📂 [FILE UPLOAD] User {user_id} "
-        f"uploaded: {file_name}"
+        f"📂 [FILE UPLOAD] {user_id} uploaded: {file_name}"
     )
 
     if not file_name.endswith((".csv", ".xlsx", ".xls")):
         print(
-            f"❌ [FILE UPLOAD] Unsupported file type: "
-            f"{file_name}"
+            f"❌ [FILE UPLOAD] Unsupported: {file_name}"
         )
         say(
             "⚠️ I can only read CSV or Excel files "
-            "(.csv, .xlsx, .xls). "
-            "Please upload one of those."
+            "(.csv, .xlsx, .xls)."
         )
         return
 
     say(
         f"📂 Got your file — *{file_name}*. "
-        f"Reading the contact list..."
+        f"Reading contacts and looking up any missing emails..."
     )
 
     try:
-        print(
-            f"⬇️  [FILE UPLOAD] Downloading from Slack..."
-        )
+        print("⬇️  [FILE UPLOAD] Downloading...")
         file_path = download_slack_file(file_info)
+        print(f"✅ [FILE UPLOAD] Saved to: {file_path}")
+
+        # read_contact_list returns (contacts, skipped)
+        result = read_contact_list(file_path, user_id)
+
+        # Handle both old format (list) and new format (tuple)
+        if isinstance(result, tuple):
+            contacts, skipped = result
+        else:
+            contacts = result
+            skipped  = []
+
         print(
-            f"✅ [FILE UPLOAD] Downloaded to: {file_path}"
+            f"✅ [FILE UPLOAD] {len(contacts)} contacts, "
+            f"{len(skipped)} skipped"
         )
 
-        contacts = read_contact_list(file_path, user_id)
-        print(
-            f"✅ [FILE UPLOAD] Parsed {len(contacts)} "
-            f"contacts from file"
-        )
+        # Tell user about skipped contacts
+        if skipped:
+            skipped_lines = "\n".join(
+                [f"  • {s}" for s in skipped[:10]]
+            )
+            if len(skipped) > 10:
+                skipped_lines += (
+                    f"\n  • ...and "
+                    f"{len(skipped) - 10} more"
+                )
+            say(
+                f"⚠️ *Could not find emails for "
+                f"{len(skipped)} contacts — skipping:*\n"
+                f"{skipped_lines}"
+            )
 
         if not contacts:
-            print("⚠️  [FILE UPLOAD] No valid contacts found")
             say(
-                "⚠️ The file was empty or "
-                "had no valid contacts."
+                "❌ No contacts with emails found. "
+                "Please check your file."
             )
             return
 
@@ -347,8 +391,8 @@ def handle_file_upload(event: dict, say, user_id: str):
         say(f"⚠️ Problem with your file: {e}")
 
     except Exception as e:
-        print(f"💥 [FILE UPLOAD] Unexpected error: {e}")
-        say(f"❌ Something went wrong reading the file: {e}")
+        print(f"💥 [FILE UPLOAD] Error: {e}")
+        say(f"❌ Something went wrong: {e}")
         log_action(
             action_type="error",
             detail=f"File upload error: {str(e)}"
@@ -357,7 +401,6 @@ def handle_file_upload(event: dict, say, user_id: str):
 
 # ─────────────────────────────────────────
 # HANDLE APPROVAL REPLY
-# Called when waiting=True and user sends a message
 # ─────────────────────────────────────────
 
 def handle_approval_reply(
@@ -366,11 +409,11 @@ def handle_approval_reply(
     say
 ):
     """
-    Handles reply when Riley is waiting for approval.
+    Called when waiting=True and user sends a message.
 
     Three cases:
-      "approve" → send the email, move to next contact
-      "skip"    → skip this contact, move to next
+      "approve" → send the email
+      "skip"    → skip this contact
       anything else → treat as edit feedback, redraft
     """
     state   = approval_state[user_id]
@@ -379,17 +422,19 @@ def handle_approval_reply(
     contact = result["contact"]
 
     print(
-        f"📨 [APPROVAL] User replied: '{text}' "
+        f"📨 [APPROVAL REPLY] '{text}' from {user_id} "
         f"for {contact['name']} @ {contact['business_name']}"
     )
 
-    # Clear waiting flag immediately
-    # Prevents user getting stuck if something errors
+    # Clear waiting flag IMMEDIATELY
+    # Must happen before any async work
     state["waiting"]        = False
     state["pending_result"] = None
 
+    print(f"🔓 [APPROVAL] waiting flag cleared for {user_id}")
+
     # ── APPROVE ──────────────────────────
-    if text.lower() == "approve":
+    if text.lower().strip() == "approve":
         print(
             f"✅ [APPROVAL] Approved — sending to "
             f"{contact['email']}"
@@ -399,7 +444,6 @@ def handle_approval_reply(
             stats["sent"] += 1
             print(
                 f"✅ [EMAIL SENT] {contact['name']} "
-                f"@ {contact['business_name']} "
                 f"→ {contact['email']}"
             )
             say(
@@ -410,8 +454,7 @@ def handle_approval_reply(
         else:
             stats["failed"] += 1
             print(
-                f"❌ [EMAIL FAILED] Could not send to "
-                f"{contact['email']}"
+                f"❌ [EMAIL FAILED] {contact['email']}"
             )
             say(
                 "❌ Send failed. "
@@ -421,9 +464,9 @@ def handle_approval_reply(
         return
 
     # ── SKIP ─────────────────────────────
-    if text.lower() == "skip":
+    if text.lower().strip() == "skip":
         print(
-            f"⏭️  [SKIP] Skipping {contact['name']} "
+            f"⏭️  [SKIP] {contact['name']} "
             f"@ {contact['business_name']}"
         )
         skip_contact(result)
@@ -438,7 +481,7 @@ def handle_approval_reply(
     # ── EDIT INSTRUCTIONS ────────────────
     print(
         f"✏️  [REDRAFT] Feedback for "
-        f"{contact['name']}: '{text[:100]}'"
+        f"{contact['name']}: '{text[:80]}'"
     )
     say("Got it — redrafting with your feedback...")
 
@@ -449,7 +492,8 @@ def handle_approval_reply(
             f"The CEO gave this feedback on the draft: "
             f'"{text}"\n\n'
             f"Original draft:\n{result['draft']}\n\n"
-            f"Please redraft incorporating this feedback."
+            f"Please redraft incorporating this feedback. "
+            f"Keep the same format: SUBJECT then BODY."
         )
         new_draft             = chat_with_riley(
             user_id, feedback_task
@@ -468,6 +512,7 @@ def handle_approval_reply(
             "body":    new_body
         }
 
+        # Post new draft — sets waiting=True again
         post_draft_for_approval(user_id, new_result, say)
 
     except Exception as e:
@@ -480,6 +525,10 @@ def handle_approval_reply(
         # Restore original so approve/skip still work
         state["pending_result"] = result
         state["waiting"]        = True
+        print(
+            f"🔒 [REDRAFT] Restored waiting flag "
+            f"for {user_id}"
+        )
 
 
 # ─────────────────────────────────────────
@@ -491,14 +540,14 @@ def handle_dm(event, say):
     """
     Central handler for all Slack DMs.
 
-    Routing order:
+    Routing order (strict):
     1. Ignore bot messages
     2. Only handle DMs
-    3. File upload → handle_file_upload
-    4. Commands → handle directly
-    5. Waiting for approval → handle_approval_reply
-    6. Pasted table → start_outreach_run
-    7. General chat → chat_with_riley
+    3. File upload
+    4. Commands (!reset, !status, !automode)
+    5. Approval reply (if waiting=True)
+    6. Pasted table
+    7. General chat
     """
     # Ignore bot messages — prevents infinite loops
     if event.get("bot_id"):
@@ -512,20 +561,30 @@ def handle_dm(event, say):
     text    = event.get("text", "").strip()
 
     print(
-        f"💬 [DM] User {user_id} sent: "
-        f"'{text[:80]}{'...' if len(text) > 80 else ''}'"
+        f"\n💬 [DM] From {user_id}: "
+        f"'{text[:60]}{'...' if len(text) > 60 else ''}'"
     )
+
+    # Log current approval state for debugging
+    if user_id in approval_state:
+        state = approval_state[user_id]
+        print(
+            f"   [STATE] waiting={state.get('waiting')} "
+            f"pending={state.get('pending_result') is not None} "
+            f"remaining={len(state.get('remaining_contacts', []))}"
+        )
+    else:
+        print(f"   [STATE] No active run for {user_id}")
 
     # ── FILE UPLOAD ──────────────────────
     if event.get("files"):
+        print(f"📎 [ROUTING] File upload from {user_id}")
         handle_file_upload(event, say, user_id)
         return
 
     # ── COMMANDS ─────────────────────────
-    # Work even during an outreach run
-
     if text.lower() == "!reset":
-        print(f"🔄 [COMMAND] !reset by user {user_id}")
+        print(f"🔄 [CMD] !reset from {user_id}")
         clear_history("riley", user_id)
         say(
             "🔄 Memory cleared. Starting fresh — "
@@ -534,68 +593,74 @@ def handle_dm(event, say):
         return
 
     if text.lower() == "!status":
-        print(f"📋 [COMMAND] !status by user {user_id}")
+        print(f"📋 [CMD] !status from {user_id}")
         logs      = get_recent_logs(limit=15)
         formatted = format_logs_for_slack(logs)
         say(formatted)
         return
 
     if text.lower() == "!automode on":
-        print(
-            f"⚡ [COMMAND] !automode on by user {user_id}"
-        )
+        print(f"⚡ [CMD] !automode on from {user_id}")
         set_auto_mode(user_id, True)
         say(
             "⚡ *Auto-send mode ON* — emails go out "
-            "immediately without approval. "
+            "immediately without approval.\n"
             "Type *!automode off* to switch back."
         )
         return
 
     if text.lower() == "!automode off":
-        print(
-            f"✋ [COMMAND] !automode off by user {user_id}"
-        )
+        print(f"✋ [CMD] !automode off from {user_id}")
         set_auto_mode(user_id, False)
         say(
             "✋ *Approval mode ON* — I'll show you "
-            "each draft before sending."
+            "each draft and wait for *approve* or *skip*."
         )
         return
 
-    # ── APPROVAL FLOW ────────────────────
-    # Check waiting flag — reliable even with threading
-
-    if user_id in approval_state and \
-       approval_state[user_id].get("waiting"):
+    # ── APPROVAL REPLY ───────────────────
+    # Check waiting flag — this is the critical check
+    # Must come BEFORE general chat routing
+    if user_id in approval_state:
+        state = approval_state[user_id]
         print(
-            f"📨 [ROUTING] Approval reply from {user_id}"
+            f"   [CHECK] waiting={state.get('waiting', False)}"
         )
-        handle_approval_reply(user_id, text, say)
-        return
+        if state.get("waiting", False):
+            print(
+                f"📨 [ROUTING] → approval reply from {user_id}"
+            )
+            handle_approval_reply(user_id, text, say)
+            return
 
     # ── PASTED TABLE ─────────────────────
-    # Detect pipe or tab separated table pasted in DM
-    # Must have separator, email, and multiple lines
-
     if (
         "\n" in text and
         "@" in text and
         ("|" in text or "\t" in text)
     ):
         print(
-            f"📋 [ROUTING] Pasted table detected "
-            f"from {user_id}"
+            f"📋 [ROUTING] Pasted table from {user_id}"
         )
-        contacts = parse_pasted_table(text, user_id)
+        result = parse_pasted_table(text, user_id)
+
+        if isinstance(result, tuple):
+            contacts, skipped = result
+        else:
+            contacts = result
+            skipped  = []
+
         if contacts:
-            print(
-                f"✅ [PASTED TABLE] Parsed "
-                f"{len(contacts)} contacts"
-            )
+            if skipped:
+                skipped_lines = "\n".join(
+                    [f"  • {s}" for s in skipped[:5]]
+                )
+                say(
+                    f"⚠️ *Skipped {len(skipped)} contacts "
+                    f"(no email):*\n{skipped_lines}"
+                )
             say(
-                f"📋 I can see a table with "
-                f"*{len(contacts)} contacts*. "
+                f"📋 Found *{len(contacts)} contacts*. "
                 f"Starting outreach run..."
             )
             start_outreach_run(user_id, contacts, say)
@@ -603,11 +668,11 @@ def handle_dm(event, say):
         else:
             print(
                 "⚠️  [PASTED TABLE] Could not parse "
-                "contacts — falling through to chat"
+                "— falling through to chat"
             )
 
     # ── GENERAL CHAT ─────────────────────
-    print(f"💬 [ROUTING] General chat for {user_id}")
+    print(f"💬 [ROUTING] → general chat for {user_id}")
     # say("_Thinking..._")
     reply = chat_with_riley(user_id, text)
     say(reply)
