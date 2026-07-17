@@ -291,7 +291,7 @@ def parse_draft(draft: str) -> tuple[str, str]:
     """
     Splits Riley's raw draft response into
     subject line and email body.
-    Falls back gracefully if format is unexpected.
+    Falls back gracefully ,if format is unexpected.
     """
     lines      = draft.strip().split("\n")
     subject    = ""
