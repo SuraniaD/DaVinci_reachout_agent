@@ -1,4 +1,5 @@
 import os
+import re
 import resend
 from datetime import datetime, timezone
 from dotenv import load_dotenv
@@ -16,18 +17,40 @@ FROM_NAME      = os.environ.get(
 )
 
 
+def _strip_token_footer(body: str) -> str:
+    """
+    Removes token usage footer from email body.
+    Footer is for Slack only — never goes in emails.
+    """
+    divider = "─────────────────────"
+    if divider in body:
+        body = body[:body.index(divider)].strip()
+
+    # Also strip any leftover token percentage lines
+    body = re.sub(
+        r'\n*─+\n.*?remaining today.*$',
+        '',
+        body,
+        flags=re.DOTALL
+    ).strip()
+
+    return body
+
+
 def _text_to_html(body: str) -> str:
     """
     Converts plain text email body to clean HTML.
-    Preserves line breaks and renders any HTML links
-    that Riley included (e.g. <a href="...">...</a>).
+    Strips token footer first — Slack only.
+    Preserves HTML links Riley included in the body.
     """
+    # Always strip footer before converting
+    body = _strip_token_footer(body)
+
     # Split into paragraphs on double newlines
     paragraphs = body.strip().split("\n\n")
 
     html_parts = []
     for para in paragraphs:
-        # Convert single newlines within paragraph to <br>
         para_html = para.replace("\n", "<br>")
         html_parts.append(f"<p>{para_html}</p>")
 
@@ -71,13 +94,17 @@ def send_email(
 ) -> bool:
     """
     Sends email via Resend API as HTML.
-    Converts Riley's plain text body to HTML
-    so hyperlinks in the sign off and CTA render.
+    Token footer stripped before sending.
+    Hyperlinks in body render correctly.
     """
     try:
         print(f"📧 [EMAIL] Sending to {to_email}...")
         print(f"📧 [EMAIL] From: {FROM_NAME} <{FROM_EMAIL}>")
         print(f"📧 [EMAIL] Subject: {subject}")
+        print(
+            f"📧 [EMAIL] Resend key set: "
+            f"{bool(resend.api_key)}"
+        )
 
         html_body = _text_to_html(body)
 
@@ -86,14 +113,12 @@ def send_email(
             "to":      [to_email],
             "subject": subject,
             "html":    html_body,
-            # Plain text fallback for email clients
-            # that don't render HTML
-            "text":    body
+            "text":    _strip_token_footer(body)
         }
 
-        print(f"📧 [EMAIL] Sending via Resend...")
+        print("📧 [EMAIL] Sending via Resend...")
         response = resend.Emails.send(params)
-        print(f"📧 [EMAIL] Full response: {response}")
+        print(f"📧 [EMAIL] Response: {response}")
 
         email_id = (
             response.get("id")
@@ -102,16 +127,13 @@ def send_email(
         )
 
         if email_id:
-            print(
-                f"✅ [EMAIL] Accepted by Resend — "
-                f"ID: {email_id}"
-            )
+            print(f"✅ [EMAIL] Sent — ID: {email_id}")
             _record_outreach(
                 contact_name=contact_name,
                 business_name=business_name,
                 email_address=to_email,
                 subject=subject,
-                body=body,
+                body=_strip_token_footer(body),
                 status="sent"
             )
             log_action(
@@ -122,36 +144,32 @@ def send_email(
             )
             return True
         else:
-            print(
-                f"❌ [EMAIL] No ID returned — "
-                f"response: {response}"
-            )
+            print(f"❌ [EMAIL] No ID — response: {response}")
             _record_outreach(
                 contact_name=contact_name,
                 business_name=business_name,
                 email_address=to_email,
                 subject=subject,
-                body=body,
+                body=_strip_token_footer(body),
                 status="failed"
             )
             log_action(
                 action_type="error",
                 contact_name=contact_name,
                 business_name=business_name,
-                detail=f"No ID: {response}"
+                detail=f"No ID returned: {response}"
             )
             return False
 
     except Exception as e:
         print(f"❌ [EMAIL] Exception: {e}")
         print(f"❌ [EMAIL] Type: {type(e).__name__}")
-
         _record_outreach(
             contact_name=contact_name,
             business_name=business_name,
             email_address=to_email,
             subject=subject,
-            body=body,
+            body=_strip_token_footer(body),
             status="failed"
         )
         log_action(

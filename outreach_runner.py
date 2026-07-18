@@ -1,3 +1,4 @@
+import re
 from tools.research import research_business
 from tools.email_sender import send_email, record_skipped
 from agents.riley import draft_outreach_email, parse_draft
@@ -13,7 +14,7 @@ def is_auto_mode(user_id: str) -> bool:
 def set_auto_mode(user_id: str, value: bool):
     auto_mode_settings[user_id] = value
     mode = "AUTO-SEND" if value else "APPROVAL"
-    print(f"⚙️  [MODE] Set to {mode} for {user_id}")
+    print(f"⚙️  [MODE] {mode} for {user_id}")
 
 
 def process_contact(
@@ -23,8 +24,8 @@ def process_contact(
 ) -> dict | None:
     """
     Handles one contact — research + draft.
-    Now passes extra_context from sheet columns
-    into the draft for better personalisation.
+    Passes extra_context from sheet columns
+    alongside web research for richer emails.
     """
     name          = contact.get("name", "")
     business      = contact.get("business_name", "")
@@ -40,16 +41,14 @@ def process_contact(
             f"*{name}* at *{business}*..."
         )
 
-        # Combine web research with sheet context
+        # Combine sheet context with web research
         full_research = ""
         if extra_context:
             full_research += (
                 f"Context from prospect list:\n"
                 f"{extra_context}\n\n"
             )
-        full_research += (
-            f"Web research:\n{research}"
-        )
+        full_research += f"Web research:\n{research}"
 
         draft = draft_outreach_email(
             user_id=user_id,
@@ -82,6 +81,7 @@ def process_contact(
 
 
 def send_approved_email(result: dict) -> bool:
+    """Sends the email for an approved contact."""
     contact = result["contact"]
     return send_email(
         to_email=contact["email"],
@@ -93,6 +93,7 @@ def send_approved_email(result: dict) -> bool:
 
 
 def skip_contact(result: dict):
+    """Records a contact as skipped."""
     contact = result["contact"]
     record_skipped(
         contact_name=contact["name"],
@@ -104,13 +105,31 @@ def skip_contact(result: dict):
 
 
 def format_draft_for_slack(result: dict) -> str:
+    """
+    Formats draft for Slack approval message.
+    Strips HTML tags and token footer so the
+    preview reads cleanly in Slack.
+    """
     contact = result["contact"]
+
+    # Strip HTML tags for clean Slack display
+    clean_body = re.sub(r'<[^>]+>', '', result["body"])
+
+    # Strip token footer
+    divider = "─────────────────────"
+    if divider in clean_body:
+        clean_body = clean_body[
+            :clean_body.index(divider)
+        ].strip()
+
+    clean_body = clean_body.strip()
+
     return (
         f"📩 *Draft for {contact['name']} "
         f"at {contact['business_name']}*\n"
         f"*To:* {contact['email']}\n"
         f"*Subject:* {result['subject']}\n\n"
-        f"{result['body']}\n\n"
+        f"{clean_body}\n\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"Reply *approve* to send · "
         f"*skip* to skip · "
@@ -124,6 +143,7 @@ def generate_summary(
     skipped: int,
     failed:  int
 ) -> str:
+    """Final summary posted in Slack when run completes."""
     return (
         f"✅ *Outreach run complete*\n\n"
         f"📊 *Results:*\n"
