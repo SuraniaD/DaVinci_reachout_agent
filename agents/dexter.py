@@ -10,9 +10,13 @@ load_dotenv()
 
 # ─────────────────────────────────────────
 # DEXTER USES KEY 1 — SEPARATE FROM RILEY
+# GROQ_API_KEY_DEXTER → Key 1
+# GROQ_API_KEY_RILEY  → Key 2 (in riley.py)
 # ─────────────────────────────────────────
 
-client = Groq(api_key=os.environ.get("GROQ_API_KEY_DEXTER"))
+client = Groq(
+    api_key=os.environ.get("GROQ_API_KEY_DEXTER")
+)
 
 RESEARCH_MODEL = "llama-3.3-70b-versatile"
 CHAT_MODEL     = "llama-3.1-8b-instant"
@@ -21,8 +25,7 @@ CHAT_MODEL     = "llama-3.1-8b-instant"
 # DEXTER'S CORE IDENTITY — ~60 tokens only
 # No research rules here
 # No output format rules here
-# No pipeline formatting here
-# Those all live in skill files
+# Those live in skill files
 # ─────────────────────────────────────────
 
 DEXTER_SYSTEM_PROMPT = """
@@ -34,14 +37,17 @@ BEHAVIOUR:
 - Short and direct — this is Slack, not a report
 - Say clearly what you found and what you couldn't find
 - Ask one question if the instruction is too vague
+- For best results, use specific search terms not
+  conversational phrases e.g. "vegan cafes Amsterdam"
+  not "can you find vegan cafes in Amsterdam please"
 
 COMMANDS:
-- !prospects           → show full pipeline
-- !prospects researched → show uncontacted only
-- !prospects sent      → show emailed ones
-- !research <query>    → research businesses
-- !add <business>      → research one specific business
-- !resetrun            → cancel current session
+- !prospects              → show full pipeline
+- !prospects researched   → show uncontacted only
+- !prospects sent         → show emailed ones
+- !research <query>       → research businesses
+- !add <business>         → research one specific business
+- !resetrun               → cancel current session
 """
 
 # ─────────────────────────────────────────
@@ -68,15 +74,15 @@ def _token_footer(
     if "70b" in model.lower():
         session_tokens_research += tokens_this_call
         pct_used = min(
-            (session_tokens_research / DAILY_LIMIT_70B) * 100,
-            100
+            (session_tokens_research / DAILY_LIMIT_70B)
+            * 100, 100
         )
         label = "research (70B)"
     else:
         session_tokens_chat += tokens_this_call
         pct_used = min(
-            (session_tokens_chat / DAILY_LIMIT_8B) * 100,
-            100
+            (session_tokens_chat / DAILY_LIMIT_8B)
+            * 100, 100
         )
         label = "chat (8B)"
 
@@ -108,8 +114,8 @@ def _load_skill(filename: str) -> str:
     Only called when that specific task runs.
 
     Current Dexter skills:
-      research_skill.txt   → how to extract business data
-      prospects_skill.txt  → how to format pipeline view
+      research_skill.txt  → how to extract business data
+      prospects_skill.txt → how to format pipeline view
     """
     paths = [
         os.path.join(
@@ -123,7 +129,9 @@ def _load_skill(filename: str) -> str:
             try:
                 with open(path, "r") as f:
                     content = f.read()
-                print(f"✅ [DEXTER] Skill loaded: {filename}")
+                print(
+                    f"✅ [DEXTER] Skill loaded: {filename}"
+                )
                 return content
             except Exception as e:
                 print(
@@ -136,21 +144,20 @@ def _load_skill(filename: str) -> str:
         f"using fallback"
     )
 
-    # Fallbacks per skill
     if filename == "research_skill.txt":
         return """
 Extract business prospect data from web search results.
 Return a JSON array of businesses found.
-Each business must have:
-  business_name, contact_name (or null), email (or null),
-  website (or null), location, industry, research_summary.
+Each business must have: business_name (never null),
+contact_name (or null), email (or null),
+website (or null), location, industry, research_summary.
 research_summary: 2-3 sentences specific to this business.
-Never invent email addresses.
+Never invent email addresses. Never set business_name to null.
 Respond ONLY with a JSON array, no explanation.
 """
     if filename == "prospects_skill.txt":
         return """
-Format prospect data as a clean Slack pipeline summary.
+Format prospect pipeline as a clean Slack summary.
 Group by status. Be concise. Use emojis for status.
 """
     return ""
@@ -166,6 +173,11 @@ def _call_groq(
     max_tokens:  int,
     temperature: float = 0.7
 ) -> tuple[str, int]:
+    """
+    Calls Groq with automatic retry on rate limit.
+    Returns (content, tokens_used).
+    Works for both 70B research and 8B chat.
+    """
     for attempt in range(2):
         try:
             response = client.chat.completions.create(
@@ -183,7 +195,8 @@ def _call_groq(
             return content, tokens_used
 
         except Exception as e:
-            if "rate_limit_exceeded" in str(e) and attempt == 0:
+            if "rate_limit_exceeded" in str(e) \
+               and attempt == 0:
                 print(
                     f"⏳ [DEXTER] Rate limit on {model}"
                     f" — waiting 60s..."
@@ -196,6 +209,7 @@ def _call_groq(
 # ─────────────────────────────────────────
 # GENERAL CHAT
 # Core identity prompt only — 8B model
+# No skill files loaded here
 # ─────────────────────────────────────────
 
 def chat_with_dexter(
@@ -230,7 +244,9 @@ def chat_with_dexter(
         )
 
         add_message("dexter", user_id, "assistant", reply)
-        return reply + _token_footer(tokens_used, CHAT_MODEL)
+        return reply + _token_footer(
+            tokens_used, CHAT_MODEL
+        )
 
     except Exception as e:
         print(f"❌ [DEXTER] Chat error: {e}")
@@ -253,7 +269,7 @@ def research_businesses(
     Researches businesses matching CEO instruction.
     Loads research_skill.txt as system prompt.
     Uses 70B for better structured data extraction.
-    Returns list of prospect dicts for DB insertion.
+    Validates entries before returning.
     """
     from tools.web_researcher import search_businesses
 
@@ -264,32 +280,34 @@ def research_businesses(
         f"_Searching the web..._"
     )
 
-    # Step 1 — Web search (no LLM, no tokens)
-    raw_results = search_businesses(instruction)
+    # Step 1 — Web search (no LLM, zero tokens)
+    raw_results = search_businesses(
+        instruction, max_results=10
+    )
 
     if not raw_results:
         say_fn(
-            "⚠️ No results found. Try being more specific\n"
-            "e.g. _'vegan cafes in Berlin Germany'_"
+            "⚠️ No web results found.\n"
+            "Try specific keywords — e.g.\n"
+            "_'plant based food brands Amsterdam Netherlands'_"
         )
         return []
 
     say_fn("🧠 Extracting business details...")
 
     # Step 2 — Load research skill
-    # This is the ONLY place research_skill.txt loads
+    # Only loaded here — not in chat calls
     research_skill = _load_skill("research_skill.txt")
 
     # Step 3 — Build extraction task
-    # Skill goes as system, task goes as user message
-    # No history sent — not relevant for extraction
     task = f"""
 CEO instruction: "{instruction}"
 
 Web search results:
-{raw_results[:3000]}
+{raw_results[:6000]}
 
-Extract up to 5 businesses from these results.
+Extract ALL distinct businesses you can find
+in these results that match the CEO's instruction.
 """
 
     try:
@@ -305,11 +323,10 @@ Extract up to 5 businesses from these results.
                 }
             ],
             model=RESEARCH_MODEL,
-            max_tokens=2000,
+            max_tokens=3000,
             temperature=0.1
         )
 
-        # Update research token counter
         global session_tokens_research
         session_tokens_research += tokens_used
 
@@ -322,27 +339,85 @@ Extract up to 5 businesses from these results.
             f"({pct:.1f}% of 70B daily limit)"
         )
 
-        # Strip markdown fences if present
+        # ── DEFENSIVE JSON PARSING ────────────
         clean = re.sub(
             r'```(?:json)?\n?|\n?```',
             '',
             raw_output.strip()
         )
 
-        prospects = json.loads(clean)
-        print(
-            f"✅ [DEXTER] Extracted "
-            f"{len(prospects)} prospects"
+        # Find JSON array even if there's
+        # stray text before or after
+        array_match = re.search(
+            r'\[.*\]',
+            clean,
+            re.DOTALL
         )
-        return prospects
+        if array_match:
+            clean = array_match.group(0)
+
+        raw_prospects = json.loads(clean)
+
+        # ── VALIDATE EACH ENTRY ───────────────
+        valid   = []
+        invalid = []
+
+        for p in raw_prospects:
+            name = p.get("business_name")
+
+            # Skip null or placeholder names
+            if not name or \
+               str(name).strip().lower() in [
+                   "none", "null", "unknown",
+                   "", "n/a", "not found",
+                   "not available"
+               ]:
+                invalid.append(p)
+                print(
+                    f"⚠️  [DEXTER] Skipping — "
+                    f"no business name: {p}"
+                )
+                continue
+
+            # Skip if no useful data at all
+            has_data = any([
+                p.get("email"),
+                p.get("website"),
+                p.get("location"),
+                p.get("research_summary")
+            ])
+            if not has_data:
+                invalid.append(p)
+                print(
+                    f"⚠️  [DEXTER] Skipping "
+                    f"'{name}' — no useful data"
+                )
+                continue
+
+            valid.append(p)
+
+        print(
+            f"✅ [DEXTER] {len(valid)} valid, "
+            f"{len(invalid)} invalid skipped"
+        )
+
+        if not valid:
+            say_fn(
+                "⚠️ Found search results but couldn't "
+                "extract clean business data.\n"
+                "Try more specific keywords — e.g.\n"
+                "_'vegan food companies Netherlands'_"
+            )
+
+        return valid
 
     except json.JSONDecodeError as e:
         print(
             f"❌ [DEXTER] JSON parse failed: {e}\n"
-            f"Raw: {raw_output[:300]}"
+            f"Raw: {raw_output[:500]}"
         )
         say_fn(
-            "⚠️ Trouble parsing results. "
+            "⚠️ Had trouble parsing results. "
             "Try a more specific instruction."
         )
         return []

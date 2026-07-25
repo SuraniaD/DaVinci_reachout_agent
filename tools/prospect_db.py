@@ -5,14 +5,43 @@ from interaction_log import log_action
 def add_prospect(prospect: dict) -> dict | None:
     """
     Writes one prospect to the prospects table.
-    Called by Dexter after researching a business.
+    Validates required fields before inserting.
     Checks for duplicates by business_name first.
-    Returns the inserted row or None if duplicate/failed.
+    Returns the inserted row or None if failed/skipped.
     """
     try:
-        business_name = prospect.get("business_name", "")
+        business_name = prospect.get("business_name")
 
-        # Check if already exists
+        # ── VALIDATION ───────────────────────
+        if not business_name or \
+           str(business_name).strip().lower() in [
+               "none", "null", "unknown", "", "n/a",
+               "not found", "not available"
+           ]:
+            print(
+                f"⚠️  [PROSPECT DB] Skipping — "
+                f"no valid business name"
+            )
+            return None
+
+        business_name = str(business_name).strip()
+
+        # Reject entries where all key fields are null
+        has_any_data = any([
+            prospect.get("email"),
+            prospect.get("website"),
+            prospect.get("location"),
+            prospect.get("research_summary")
+        ])
+
+        if not has_any_data:
+            print(
+                f"⚠️  [PROSPECT DB] Skipping "
+                f"'{business_name}' — no useful data"
+            )
+            return None
+
+        # ── DUPLICATE CHECK ───────────────────
         existing = supabase.table("prospects") \
             .select("id, business_name, outreach_status") \
             .ilike("business_name", business_name) \
@@ -27,15 +56,16 @@ def add_prospect(prospect: dict) -> dict | None:
             )
             return None
 
+        # ── INSERT ────────────────────────────
         row = {
             "business_name":    business_name,
-            "contact_name":     prospect.get("contact_name"),
-            "email":            prospect.get("email"),
-            "website":          prospect.get("website"),
-            "location":         prospect.get("location"),
-            "industry":         prospect.get("industry"),
-            "research_summary": prospect.get("research_summary"),
-            "source_query":     prospect.get("source_query"),
+            "contact_name":     prospect.get("contact_name") or None,
+            "email":            prospect.get("email") or None,
+            "website":          prospect.get("website") or None,
+            "location":         prospect.get("location") or None,
+            "industry":         prospect.get("industry") or None,
+            "research_summary": prospect.get("research_summary") or None,
+            "source_query":     prospect.get("source_query") or None,
             "outreach_status":  "researched"
         }
 
@@ -47,14 +77,15 @@ def add_prospect(prospect: dict) -> dict | None:
             inserted = result.data[0]
             print(
                 f"✅ [PROSPECT DB] Added: "
-                f"{business_name} (ID: {inserted['id']})"
+                f"'{business_name}' (ID: {inserted['id']})"
             )
             log_action(
                 action_type="prospect_added",
                 business_name=business_name,
                 detail=(
                     f"Added by Dexter — "
-                    f"email: {prospect.get('email', 'unknown')}"
+                    f"email: "
+                    f"{prospect.get('email') or 'unknown'}"
                 )
             )
             return inserted
@@ -62,7 +93,7 @@ def add_prospect(prospect: dict) -> dict | None:
     except Exception as e:
         print(
             f"❌ [PROSPECT DB] Could not add "
-            f"{prospect.get('business_name')}: {e}"
+            f"'{prospect.get('business_name')}': {e}"
         )
         return None
 
@@ -126,8 +157,6 @@ def update_prospect_status(
     """
     Updates outreach_status of a prospect.
     Called by Riley when status changes.
-    Valid: researched → draft_ready → approved → sent
-           → replied → closed → skipped
     """
     try:
         supabase.table("prospects") \
@@ -210,9 +239,7 @@ def format_prospects_for_slack(
     prospects: list[dict],
     title:     str = "📋 Prospect Pipeline"
 ) -> str:
-    """
-    Formats prospects into a clean Slack message.
-    """
+    """Formats prospects into a clean Slack message."""
     if not prospects:
         return (
             "📋 No prospects found.\n"
@@ -237,7 +264,7 @@ def format_prospects_for_slack(
             p["outreach_status"], "•"
         )
         name   = p["business_name"]
-        loc    = p.get("location", "")
+        loc    = p.get("location") or ""
         status = p["outreach_status"].replace("_", " ")
         email  = p.get("email") or "no email"
 

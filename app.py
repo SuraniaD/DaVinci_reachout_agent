@@ -22,7 +22,10 @@ from outreach_runner import (
     is_auto_mode,
     set_auto_mode
 )
-from tools.file_reader import read_contact_list, parse_pasted_table
+from tools.file_reader import (
+    read_contact_list,
+    parse_pasted_table
+)
 from tools.run_state import (
     save_run_state,
     load_all_run_states,
@@ -46,8 +49,7 @@ load_dotenv()
 
 # ─────────────────────────────────────────
 # TWO SLACK APPS — RILEY AND DEXTER
-# Each has its own bot token and signing secret
-# Both run in the same Railway process
+# Same Railway process, separate bot tokens
 # ─────────────────────────────────────────
 
 riley_app = App(
@@ -69,14 +71,14 @@ dexter_client = WebClient(
 )
 
 # ─────────────────────────────────────────
-# RILEY'S APPROVAL STATE
+# RILEY APPROVAL STATE
 # ─────────────────────────────────────────
 
 approval_state = {}
 
 
 # ─────────────────────────────────────────
-# SHARED HELPER — DOWNLOAD FILE FROM SLACK
+# DOWNLOAD FILE FROM SLACK
 # ─────────────────────────────────────────
 
 def download_slack_file(
@@ -99,7 +101,144 @@ def download_slack_file(
 
 
 # ═══════════════════════════════════════════
-# DEXTER EVENT HANDLERS
+# DEXTER — RESEARCH RUNNER
+# ═══════════════════════════════════════════
+
+def _run_research(
+    user_id:     str,
+    instruction: str,
+    say
+):
+    """
+    Runs Dexter's research in a background thread.
+    Correctly reports added vs duplicate vs invalid.
+    """
+    def _run():
+        session_id = start_research_session(
+            user_id, instruction
+        )
+
+        try:
+            prospects = research_businesses(
+                user_id=user_id,
+                instruction=instruction,
+                say_fn=say
+            )
+
+            if not prospects:
+                complete_research_session(
+                    session_id, 0, "failed"
+                )
+                return
+
+            added      = []
+            duplicates = []
+            invalid    = []
+
+            for p in prospects:
+                p["source_query"] = instruction
+                result = add_prospect(p)
+
+                if result:
+                    added.append(p["business_name"])
+                else:
+                    name = p.get("business_name", "")
+                    if name and name.lower() not in [
+                        "none", "null", "unknown",
+                        "", "n/a", "not found"
+                    ]:
+                        duplicates.append(name)
+                    else:
+                        invalid.append(str(p))
+
+            complete_research_session(
+                session_id, len(added)
+            )
+
+            if not added and not duplicates:
+                say(
+                    "⚠️ No valid businesses could be "
+                    "added from those results.\n"
+                    "Try more specific keywords — e.g.\n"
+                    "_'vegan food brands Netherlands'_"
+                )
+                return
+
+            # Build summary
+            lines = [
+                f"✅ *Research complete:* "
+                f"_{instruction}_\n"
+            ]
+
+            if added:
+                lines.append(
+                    f"*Added {len(added)} "
+                    f"new prospects:*"
+                )
+                for name in added:
+                    p_data = get_prospect_by_name(name)
+                    email  = (
+                        p_data.get("email") or "no email"
+                        if p_data else "no email"
+                    )
+                    loc = (
+                        p_data.get("location") or ""
+                        if p_data else ""
+                    )
+                    line = f"  🔬 *{name}*"
+                    if loc:
+                        line += f" — {loc}"
+                    line += f"\n     {email}"
+                    lines.append(line)
+
+            if duplicates:
+                lines.append(
+                    f"\n*Already in DB "
+                    f"({len(duplicates)}):*"
+                )
+                for name in duplicates:
+                    lines.append(f"  • {name}")
+
+            if invalid:
+                lines.append(
+                    f"\n_{len(invalid)} entries had "
+                    f"no business name and were skipped_"
+                )
+
+            lines.append(
+                f"\n_Type *!prospects* to see "
+                f"your full pipeline._"
+            )
+
+            say("\n\n".join(lines))
+
+            log_action(
+                action_type="research",
+                detail=(
+                    f"Dexter: '{instruction}' — "
+                    f"{len(added)} added, "
+                    f"{len(duplicates)} duplicate, "
+                    f"{len(invalid)} invalid"
+                )
+            )
+
+        except Exception as e:
+            print(
+                f"💥 [DEXTER] Research run failed: {e}"
+            )
+            say(f"❌ Research failed: {e}")
+            if session_id:
+                complete_research_session(
+                    session_id, 0, "failed"
+                )
+
+    thread = threading.Thread(target=_run)
+    thread.daemon = True
+    thread.start()
+
+
+# ═══════════════════════════════════════════
+# DEXTER EVENT HANDLER
 # ═══════════════════════════════════════════
 
 @dexter_app.event("message")
@@ -109,11 +248,12 @@ def handle_dexter_dm(event, say):
 
     Routing:
     1. Ignore bot messages
-    2. Only handle DMs
-    3. !prospects — show pipeline
-    4. !add <business> — research one business
-    5. !research or plain instruction — research query
-    6. General chat — chat_with_dexter
+    2. DMs only
+    3. !prospects → show pipeline
+    4. !add → research one business
+    5. !research → research query
+    6. Research intent detected → research
+    7. General chat
     """
     if event.get("bot_id"):
         return
@@ -147,7 +287,9 @@ def handle_dexter_dm(event, say):
         if status:
             title = f"📋 Prospects — {status}"
 
-        say(format_prospects_for_slack(prospects, title))
+        say(format_prospects_for_slack(
+            prospects, title
+        ))
         return
 
     # ── !add <business> ──────────────────
@@ -163,12 +305,10 @@ def handle_dexter_dm(event, say):
         print(
             f"➕ [DEXTER CMD] !add: '{business_query}'"
         )
-
         _run_research(
             user_id=user_id,
             instruction=business_query,
-            say=say,
-            single=True
+            say=say
         )
         return
 
@@ -179,14 +319,13 @@ def handle_dexter_dm(event, say):
             say(
                 "⚠️ Tell me what to research.\n"
                 "Example: "
-                "*!research vegan cafes in Berlin*"
+                "*!research vegan cafes Berlin*"
             )
             return
 
         print(
             f"🔬 [DEXTER CMD] !research: '{query}'"
         )
-
         _run_research(
             user_id=user_id,
             instruction=query,
@@ -194,17 +333,15 @@ def handle_dexter_dm(event, say):
         )
         return
 
-    # ── PLAIN TEXT — research intent ──────
-    # If message looks like a research instruction
-    # treat it as a research request
+    # ── RESEARCH INTENT DETECTION ─────────
     research_signals = [
         "find", "search", "look for", "research",
         "get me", "i need", "can you find",
         "businesses", "companies", "shops",
         "cafes", "bakeries", "agencies",
-        "startups", "brands", "stores"
+        "startups", "brands", "stores", "brands"
     ]
-    text_lower = text.lower()
+    text_lower         = text.lower()
     is_research_intent = any(
         s in text_lower for s in research_signals
     )
@@ -212,6 +349,12 @@ def handle_dexter_dm(event, say):
     if is_research_intent:
         print(
             f"🔬 [DEXTER] Research intent detected"
+        )
+        say(
+            "_Searching — for best results use short "
+            "keywords like_ "
+            "`!research vegan brands Netherlands` "
+            "_rather than full sentences._"
         )
         _run_research(
             user_id=user_id,
@@ -227,134 +370,8 @@ def handle_dexter_dm(event, say):
     say(reply)
 
 
-# ─────────────────────────────────────────
-# DEXTER RESEARCH RUNNER
-# Runs in background thread so Slack doesn't time out
-# ─────────────────────────────────────────
-
-def _run_research(
-    user_id:     str,
-    instruction: str,
-    say,
-    single:      bool = False
-):
-    """
-    Runs Dexter's research in a background thread.
-    single=True means research one specific business.
-    single=False means find multiple businesses.
-    """
-    def _run():
-        # Create a research session log
-        session_id = start_research_session(
-            user_id, instruction
-        )
-
-        try:
-            # Get structured prospect data from Dexter
-            prospects = research_businesses(
-                user_id=user_id,
-                instruction=instruction,
-                say_fn=say
-            )
-
-            if not prospects:
-                complete_research_session(
-                    session_id, 0, "failed"
-                )
-                return
-
-            # Write each prospect to DB
-            added   = []
-            skipped = []
-
-            for p in prospects:
-                p["source_query"] = instruction
-                result = add_prospect(p)
-                if result:
-                    added.append(p["business_name"])
-                else:
-                    skipped.append(p["business_name"])
-
-            # Complete the session log
-            complete_research_session(
-                session_id, len(added)
-            )
-
-            # Report back in Slack
-            if not added and not skipped:
-                say(
-                    "⚠️ Found results but couldn't "
-                    "extract clean business data. "
-                    "Try being more specific."
-                )
-                return
-
-            # Build summary message
-            lines = [
-                f"✅ *Research complete for: "
-                f"'{instruction}'*\n"
-            ]
-
-            if added:
-                lines.append(
-                    f"*Added {len(added)} new prospects:*"
-                )
-                for name in added:
-                    # Get the full prospect to show email
-                    p_data = get_prospect_by_name(name)
-                    email  = (
-                        p_data.get("email", "no email")
-                        if p_data else "no email"
-                    )
-                    loc = (
-                        p_data.get("location", "")
-                        if p_data else ""
-                    )
-                    line = f"  🔬 *{name}*"
-                    if loc:
-                        line += f" — {loc}"
-                    line += f"\n     {email}"
-                    lines.append(line)
-
-            if skipped:
-                lines.append(
-                    f"\n*Already in DB ({len(skipped)}):*"
-                )
-                for name in skipped:
-                    lines.append(f"  • {name}")
-
-            lines.append(
-                f"\n_Type *!prospects* to see your "
-                f"full pipeline._"
-            )
-
-            say("\n\n".join(lines))
-
-            log_action(
-                action_type="research",
-                detail=(
-                    f"Dexter: '{instruction}' — "
-                    f"{len(added)} added, "
-                    f"{len(skipped)} skipped"
-                )
-            )
-
-        except Exception as e:
-            print(f"💥 [DEXTER] Research run failed: {e}")
-            say(f"❌ Research failed: {e}")
-            if session_id:
-                complete_research_session(
-                    session_id, 0, "failed"
-                )
-
-    thread = threading.Thread(target=_run)
-    thread.daemon = True
-    thread.start()
-
-
 # ═══════════════════════════════════════════
-# RILEY EVENT HANDLERS
-# Exactly the same as before — no changes
+# RILEY — HELPERS
 # ═══════════════════════════════════════════
 
 def _persist_state(user_id: str):
@@ -374,7 +391,7 @@ def start_outreach_run(
     say
 ):
     print(
-        f"🚀 [RILEY] Starting run for {user_id} — "
+        f"🚀 [RILEY] Run for {user_id} — "
         f"{len(contacts)} contacts"
     )
     clear_run_state(user_id)
@@ -382,13 +399,17 @@ def start_outreach_run(
     mode_msg = (
         "⚡ *Auto-send mode is ON*"
         if is_auto_mode(user_id)
-        else "✋ *Approval mode is ON* — "
-             "I'll show each draft before sending."
+        else
+        "✋ *Approval mode is ON* — "
+        "I'll show each draft before sending."
     )
 
     say(
         f"✅ Found *{len(contacts)} contacts*. "
-        f"Starting outreach run now.\n\n{mode_msg}"
+        f"Starting outreach run now.\n\n"
+        f"{mode_msg}\n\n"
+        f"_Type *!automode on* or *!automode off* "
+        f"to switch modes._"
     )
 
     approval_state[user_id] = {
@@ -432,7 +453,8 @@ def process_next_contact(user_id: str, say):
         stats     = state["stats"]
 
         print(
-            f"📋 [RILEY LOOP] {len(remaining)} remaining"
+            f"📋 [RILEY LOOP] "
+            f"{len(remaining)} remaining"
         )
 
         if not remaining:
@@ -500,7 +522,11 @@ def process_next_contact(user_id: str, say):
     thread.start()
 
 
-def handle_file_upload(event: dict, say, user_id: str):
+def handle_file_upload(
+    event:    dict,
+    say,
+    user_id:  str
+):
     file_info = event["files"][0]
     file_name = file_info.get("name", "")
 
@@ -508,13 +534,15 @@ def handle_file_upload(event: dict, say, user_id: str):
         f"📂 [RILEY] {user_id} uploaded: {file_name}"
     )
 
-    if not file_name.endswith((".csv", ".xlsx", ".xls")):
+    if not file_name.endswith(
+        (".csv", ".xlsx", ".xls")
+    ):
         say("⚠️ Please upload a .csv or .xlsx file.")
         return
 
     say(
         f"📂 Got *{file_name}* — "
-        f"reading contacts..."
+        f"reading contacts and looking up emails..."
     )
 
     try:
@@ -544,8 +572,10 @@ def handle_file_upload(event: dict, say, user_id: str):
         start_outreach_run(user_id, contacts, say)
 
     except ValueError as e:
+        print(f"❌ [RILEY] ValueError: {e}")
         say(f"⚠️ Problem with file: {e}")
     except Exception as e:
+        print(f"💥 [RILEY] File error: {e}")
         say(f"❌ Something went wrong: {e}")
         log_action(
             action_type="error",
@@ -572,6 +602,9 @@ def handle_approval_reply(
     state["pending_result"] = None
 
     if text.lower().strip() == "approve":
+        print(
+            f"✅ [RILEY] Sending to {contact['email']}"
+        )
         success = send_approved_email(result)
         if success:
             stats["sent"] += 1
@@ -599,7 +632,7 @@ def handle_approval_reply(
         process_next_contact(user_id, say)
         return
 
-    # Redraft
+    # Redraft with feedback
     say("Got it — redrafting with your feedback...")
 
     from agents.riley import parse_draft
@@ -622,7 +655,9 @@ def handle_approval_reply(
             "subject": new_subject,
             "body":    new_body
         }
-        post_draft_for_approval(user_id, new_result, say)
+        post_draft_for_approval(
+            user_id, new_result, say
+        )
 
     except Exception as e:
         say(
@@ -633,8 +668,15 @@ def handle_approval_reply(
         state["waiting"]        = True
 
 
+# ═══════════════════════════════════════════
+# RILEY EVENT HANDLER
+# ═══════════════════════════════════════════
+
 @riley_app.event("message")
 def handle_riley_dm(event, say):
+    """
+    Central handler for all Riley Slack DMs.
+    """
     if event.get("bot_id"):
         return
     if event.get("channel_type") != "im":
@@ -676,7 +718,8 @@ def handle_riley_dm(event, say):
     if text.lower() == "!automode on":
         set_auto_mode(user_id, True)
         say(
-            "⚡ *Auto-send ON* — emails go immediately."
+            "⚡ *Auto-send ON* — "
+            "emails go immediately without approval."
         )
         return
 
@@ -692,7 +735,12 @@ def handle_riley_dm(event, say):
         from tools.preferences import get_preferences
         prefs = get_preferences(user_id)
         if not prefs:
-            say("🧠 No preferences saved yet.")
+            say(
+                "🧠 No preferences saved yet.\n"
+                "Tell me things like "
+                "_'keep it under 80 words'_ "
+                "and I'll remember them."
+            )
         else:
             prefs_list = "\n".join(
                 [f"  {i+1}. {p}"
@@ -700,14 +748,15 @@ def handle_riley_dm(event, say):
             )
             say(
                 f"🧠 *Saved preferences:*\n"
-                f"{prefs_list}"
+                f"{prefs_list}\n\n"
+                f"_Type *!resetprefs* to clear all._"
             )
         return
 
     if text.lower() == "!resetprefs":
         from tools.preferences import clear_preferences
         clear_preferences(user_id)
-        say("🗑️ Preferences cleared.")
+        say("🗑️ All preferences cleared.")
         return
 
     if text.lower() == "!resetrun":
@@ -723,6 +772,7 @@ def handle_riley_dm(event, say):
     # APPROVAL REPLY
     if user_id in approval_state and \
        approval_state[user_id].get("waiting"):
+        print(f"📨 [ROUTING] → approval reply")
         handle_approval_reply(user_id, text, say)
         return
 
@@ -743,12 +793,15 @@ def handle_riley_dm(event, say):
             if skipped:
                 say(
                     f"⚠️ Skipped {len(skipped)} "
-                    f"(no email)"
+                    f"(no email found)"
                 )
-            start_outreach_run(user_id, contacts, say)
+            start_outreach_run(
+                user_id, contacts, say
+            )
             return
 
     # GENERAL CHAT
+    print(f"💬 [ROUTING] → general chat")
     say("_Thinking..._")
     reply = chat_with_riley(user_id, text)
     say(reply)
@@ -765,6 +818,11 @@ def restore_interrupted_runs():
         print("✅ [STARTUP] No interrupted runs")
         return
 
+    print(
+        f"▶️  [STARTUP] Restoring "
+        f"{len(interrupted)} run(s)..."
+    )
+
     for row in interrupted:
         user_id   = row["user_id"]
         remaining = row["remaining_contacts"]
@@ -773,7 +831,7 @@ def restore_interrupted_runs():
         })
 
         print(
-            f"▶️  [STARTUP] Restoring {user_id} — "
+            f"▶️  [STARTUP] {user_id} — "
             f"{len(remaining)} remaining"
         )
 
@@ -790,7 +848,7 @@ def restore_interrupted_runs():
                     channel=uid,
                     text=(
                         f"👋 I'm back after a restart.\n\n"
-                        f"Picking up — "
+                        f"Picking up your outreach run — "
                         f"*{len(rem)} contacts remaining*.\n"
                         f"Progress: "
                         f"{sts.get('sent', 0)} sent · "
@@ -838,7 +896,6 @@ if __name__ == "__main__":
         os.environ.get("DEXTER_APP_TOKEN")
     )
 
-    # Start Dexter in a background thread
     dexter_thread = threading.Thread(
         target=dexter_handler.start
     )
@@ -852,5 +909,8 @@ if __name__ == "__main__":
         os.environ.get("RILEY_APP_TOKEN")
     )
 
-    print("✅ Both agents live. DM Dexter or Riley in Slack.")
-    riley_handler.start()  # Blocks — runs in main thread
+    print(
+        "✅ Both agents live. "
+        "DM Dexter or Riley in Slack."
+    )
+    riley_handler.start()

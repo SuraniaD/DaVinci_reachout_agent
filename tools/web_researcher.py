@@ -2,40 +2,56 @@ from ddgs import DDGS
 from interaction_log import log_action
 
 
-def search_businesses(query: str) -> str:
+def search_businesses(
+    query:       str,
+    max_results: int = 10
+) -> str:
     """
     Searches DuckDuckGo for businesses matching a query.
     Returns raw text results for the 70B model to process.
-
-    This is intentionally raw — the LLM does the
-    extraction and structuring, not this function.
+    Runs multiple targeted queries for wider coverage.
+    Deduplicates results by URL.
     """
     try:
-        print(f"🌐 [WEB RESEARCHER] Searching: '{query}'")
+        print(
+            f"🌐 [WEB RESEARCHER] Searching: '{query}' "
+            f"(max {max_results} per query)"
+        )
 
-        # Run multiple targeted searches for better coverage
         search_queries = [
             query,
             f"{query} contact email",
-            f"{query} owner founder"
+            f"{query} owner founder website",
+            f"{query} list directory"
         ]
 
         all_results = []
+        seen_urls   = set()
 
         for q in search_queries:
             try:
-                results = DDGS().text(q, max_results=5)
+                results = DDGS().text(
+                    q, max_results=max_results
+                )
                 for r in results:
+                    url = r.get("href", "")
+
+                    # Deduplicate by URL
+                    if url and url in seen_urls:
+                        continue
+                    seen_urls.add(url)
+
                     if r.get("body"):
                         all_results.append(
                             f"Title: {r['title']}\n"
-                            f"URL: {r.get('href', '')}\n"
+                            f"URL: {url}\n"
                             f"Body: {r['body']}\n"
                         )
+
             except Exception as e:
                 print(
                     f"⚠️  [WEB RESEARCHER] "
-                    f"Search '{q}' failed: {e}"
+                    f"Query '{q}' failed: {e}"
                 )
                 continue
 
@@ -47,9 +63,10 @@ def search_businesses(query: str) -> str:
             return ""
 
         combined = "\n---\n".join(all_results)
+
         print(
             f"✅ [WEB RESEARCHER] "
-            f"{len(all_results)} results found"
+            f"{len(all_results)} unique results found"
         )
 
         log_action(
@@ -82,14 +99,17 @@ def search_email_for_business(
     queries = []
 
     if website:
-        domain = website.replace("https://", "") \
-                        .replace("http://", "") \
-                        .replace("www.", "") \
-                        .split("/")[0]
+        domain = website \
+            .replace("https://", "") \
+            .replace("http://", "") \
+            .replace("www.", "") \
+            .split("/")[0]
         queries.append(
             f'"{business_name}" email {domain}'
         )
-        queries.append(f"site:{domain} contact email")
+        queries.append(
+            f"site:{domain} contact email"
+        )
 
     queries.append(
         f'"{business_name}" '
@@ -100,15 +120,14 @@ def search_email_for_business(
 
     for q in queries:
         try:
-            results = DDGS().text(q, max_results=4)
+            results = DDGS().text(q, max_results=5)
             for r in results:
                 text = (
                     r.get("title", "") + " " +
-                    r.get("body", "")
+                    r.get("body",  "")
                 )
                 emails = re.findall(email_pattern, text)
 
-                # Filter junk
                 junk = [
                     "example.com", "test.com",
                     "shopify.com", "wixpress.com",

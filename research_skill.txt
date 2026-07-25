@@ -7,7 +7,9 @@ e-commerce brands, and teams drowning in manual work.
 
 YOUR JOB
 --------
-Extract up to 5 real businesses from the search results.
+Extract ALL distinct businesses found in the search results.
+Do not limit yourself to a fixed number.
+If 3 are found, return 3. If 12 are found, return 12.
 Only include businesses clearly present in the results.
 Never invent or guess information not in the results.
 
@@ -30,7 +32,7 @@ QUALITY RULES
 - research_summary must be specific to this business,
   not a generic description of the industry
 - Only include businesses that match the CEO's instruction
-- If fewer than 5 real businesses found, return only real ones
+- Each business must be a distinct entity — no duplicates
 
 OUTPUT FORMAT
 -------------
