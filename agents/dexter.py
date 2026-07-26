@@ -15,18 +15,25 @@ client = Groq(
 RESEARCH_MODEL = "llama-3.3-70b-versatile"
 CHAT_MODEL     = "llama-3.1-8b-instant"
 
+# ─────────────────────────────────────────
+# CORE IDENTITY — ~60 tokens
+# General purpose — NOT vegan specific
+# ─────────────────────────────────────────
+
 DEXTER_SYSTEM_PROMPT = """
 You are Dexter, Research Manager at DaVinci AI.
-You find businesses for the CEO to reach out to.
+DaVinci AI helps businesses automate workflows with AI agents.
+You find business prospects for the CEO to reach out to.
 You speak directly with the CEO over Slack DM.
+
+You research ANY type of business in ANY location.
+You are not limited to any industry or geography.
 
 BEHAVIOUR:
 - Short and direct — this is Slack, not a report
+- Before researching, confirm industry and location
 - Say clearly what you found and what you couldn't find
-- Ask one question if the instruction is too vague
-- For best results, use specific search terms not
-  conversational phrases e.g. "vegan cafes Amsterdam"
-  not "can you find vegan cafes in Amsterdam please"
+- Use specific search terms for best results
 
 COMMANDS:
 - !prospects              → show full pipeline
@@ -42,6 +49,96 @@ DAILY_LIMIT_8B  = 500_000
 
 session_tokens_research = 0
 session_tokens_chat     = 0
+
+# ─────────────────────────────────────────
+# ELICITATION STATE
+# Tracks which users Dexter is asking
+# clarifying questions to before researching
+# ─────────────────────────────────────────
+
+# Structure per user_id:
+# {
+#   "stage":    "industry" | "location" | "ready"
+#   "industry": str
+#   "location": str
+#   "original": str  ← original message that triggered flow
+# }
+
+elicitation_state = {}
+
+
+def _needs_elicitation(text: str) -> bool:
+    """
+    Returns True if the instruction is too vague
+    and needs industry/location clarification.
+
+    Skips elicitation if the message already contains
+    enough specific detail — both an industry type
+    and a location hint.
+    """
+    text_lower = text.lower()
+
+    # Location indicators
+    location_words = [
+        "in ", "at ", "near ", "around ",
+        "uk", "usa", "us", "australia", "canada",
+        "germany", "france", "netherlands", "india",
+        "london", "berlin", "paris", "amsterdam",
+        "new york", "sydney", "singapore", "dubai",
+        "city", "country", "region", "europe",
+        "asia", "africa", "america"
+    ]
+
+    # Industry indicators
+    industry_words = [
+        "cafe", "bakery", "restaurant", "shop",
+        "agency", "startup", "saas", "software",
+        "ecommerce", "retail", "brand", "company",
+        "firm", "studio", "clinic", "gym", "salon",
+        "hotel", "bar", "pub", "store", "service",
+        "consultant", "freelancer", "manufacturer",
+        "supplier", "distributor", "wholesaler",
+        "vegan", "organic", "tech", "fintech",
+        "health", "wellness", "fashion", "food",
+        "beverage", "marketing", "design", "law",
+        "accounting", "finance", "real estate",
+        "construction", "education", "media"
+    ]
+
+    has_location = any(w in text_lower for w in location_words)
+    has_industry = any(w in text_lower for w in industry_words)
+
+    # If both are present — no need to ask
+    if has_location and has_industry:
+        return False
+
+    # If neither — definitely ask
+    # If only one — ask for the missing one
+    return True
+
+
+def _build_search_query(
+    industry: str,
+    location: str,
+    original: str = ""
+) -> str:
+    """
+    Builds a clean, specific DuckDuckGo search query
+    from confirmed industry and location.
+    """
+    # Clean up the inputs
+    industry = industry.strip().lower()
+    location = location.strip()
+
+    query = f"{industry} businesses {location}"
+
+    print(
+        f"🔎 [DEXTER] Built query: '{query}' "
+        f"(from industry='{industry}' "
+        f"location='{location}')"
+    )
+
+    return query
 
 
 def _token_footer(
@@ -84,10 +181,6 @@ def _token_footer(
 
 
 def _load_skill(filename: str) -> str:
-    """
-    Loads a skill file from the project root.
-    Only called when that specific task runs.
-    """
     paths = [
         os.path.join(
             os.path.dirname(__file__), "..", filename
@@ -118,12 +211,12 @@ def _load_skill(filename: str) -> str:
     if filename == "research_skill.txt":
         return """
 Extract business prospect data from web search results.
-Return a JSON array of businesses found.
-Each business must have: business_name (never null),
+Return a JSON array of ALL businesses found.
+Each entry must have: business_name (never null),
 contact_name (or null), email (or null),
 website (or null), location, industry, research_summary.
 research_summary: 2-3 sentences specific to this business.
-Never invent email addresses. Never set business_name to null.
+Never invent emails. Never set business_name to null.
 Respond ONLY with a JSON array, no explanation.
 """
     return ""
@@ -199,73 +292,47 @@ def chat_with_dexter(
         return f"Sorry, hit an error: {e}."
 
 
-# ─────────────────────────────────────────
-# EMAIL RESOLUTION
-# Uses Riley's email_finder tools to find
-# missing emails for researched prospects
-# ─────────────────────────────────────────
-
 def _resolve_email(
     business_name: str,
     website:       str = None,
     location:      str = None
 ) -> str | None:
-    """
-    Tries to find an email for a business using
-    Riley's existing email_finder tools.
-
-    Priority order:
-    1. If website URL found — search for email at domain
-    2. If no website — search by business name + location
-    3. Return None if nothing found
-    """
     from tools.email_finder import (
         find_email_from_website,
         find_email_from_business_name
     )
 
     print(
-        f"📧 [EMAIL RESOLVER] Looking for email: "
+        f"📧 [EMAIL RESOLVER] Looking for: "
         f"{business_name}"
     )
 
-    # Strategy 1 — search via website domain
     if website:
         email = find_email_from_website(
             business_name, website
         )
         if email:
             print(
-                f"✅ [EMAIL RESOLVER] Found via website: "
+                f"✅ [EMAIL RESOLVER] Via website: "
                 f"{email}"
             )
             return email
 
-    # Strategy 2 — search by business name + location
     email = find_email_from_business_name(
         business_name, location
     )
     if email:
         print(
-            f"✅ [EMAIL RESOLVER] Found via name search: "
-            f"{email}"
+            f"✅ [EMAIL RESOLVER] Via name: {email}"
         )
         return email
 
     print(
-        f"❌ [EMAIL RESOLVER] No email found for "
+        f"❌ [EMAIL RESOLVER] Not found for "
         f"{business_name}"
     )
     return None
 
-
-# ─────────────────────────────────────────
-# RESEARCH BUSINESSES
-# Loads research_skill.txt — only here
-# Uses 70B model for extraction
-# Then hunts for missing emails using
-# Riley's email_finder tools
-# ─────────────────────────────────────────
 
 def research_businesses(
     user_id:     str,
@@ -273,25 +340,19 @@ def research_businesses(
     say_fn
 ) -> list[dict]:
     """
-    Researches businesses matching CEO instruction.
-
-    Flow:
-    1. DuckDuckGo web search (zero tokens)
-    2. 70B model extracts structured business data
-    3. For any prospect missing email — email_finder
-       searches for it using website or business name
-    4. Returns validated list ready for DB insert
+    Researches businesses matching the instruction.
+    instruction should already have industry + location
+    confirmed via elicitation before this is called.
     """
     from tools.web_researcher import search_businesses
 
     print(f"🔬 [DEXTER] Research: '{instruction}'")
 
     say_fn(
-        f"🔬 On it — researching: *{instruction}*\n"
+        f"🔬 Researching: *{instruction}*\n"
         f"_Searching the web..._"
     )
 
-    # Step 1 — Web search, zero tokens
     raw_results = search_businesses(
         instruction, max_results=10
     )
@@ -299,25 +360,21 @@ def research_businesses(
     if not raw_results:
         say_fn(
             "⚠️ No web results found.\n"
-            "Try specific keywords — e.g.\n"
-            "_'plant based food brands Amsterdam "
-            "Netherlands'_"
+            "Try different keywords or a broader location."
         )
         return []
 
     say_fn("🧠 Extracting business details...")
 
-    # Step 2 — Load research skill (only here)
     research_skill = _load_skill("research_skill.txt")
 
     task = f"""
-CEO instruction: "{instruction}"
+Search intent: "{instruction}"
 
 Web search results:
 {raw_results[:6000]}
 
-Extract ALL distinct businesses you can find
-in these results that match the CEO's instruction.
+Extract ALL distinct businesses matching the search intent.
 """
 
     try:
@@ -349,11 +406,9 @@ in these results that match the CEO's instruction.
             f"({pct:.1f}% of 70B daily limit)"
         )
 
-        # Defensive JSON parsing
         clean = re.sub(
             r'```(?:json)?\n?|\n?```',
-            '',
-            raw_output.strip()
+            '', raw_output.strip()
         )
         array_match = re.search(
             r'\[.*\]', clean, re.DOTALL
@@ -363,7 +418,6 @@ in these results that match the CEO's instruction.
 
         raw_prospects = json.loads(clean)
 
-        # Validate entries
         valid   = []
         invalid = []
 
@@ -372,15 +426,10 @@ in these results that match the CEO's instruction.
 
             if not name or \
                str(name).strip().lower() in [
-                   "none", "null", "unknown",
-                   "", "n/a", "not found",
-                   "not available"
+                   "none", "null", "unknown", "",
+                   "n/a", "not found", "not available"
                ]:
                 invalid.append(p)
-                print(
-                    f"⚠️  [DEXTER] No business name — "
-                    f"skipping"
-                )
                 continue
 
             has_data = any([
@@ -391,55 +440,39 @@ in these results that match the CEO's instruction.
             ])
             if not has_data:
                 invalid.append(p)
-                print(
-                    f"⚠️  [DEXTER] No useful data for "
-                    f"'{name}' — skipping"
-                )
                 continue
 
             valid.append(p)
 
         print(
             f"✅ [DEXTER] {len(valid)} valid, "
-            f"{len(invalid)} invalid skipped"
+            f"{len(invalid)} invalid"
         )
 
         if not valid:
             say_fn(
-                "⚠️ Found search results but couldn't "
-                "extract clean business data.\n"
+                "⚠️ Couldn't extract clean business data.\n"
                 "Try more specific keywords."
             )
             return []
 
-        # ─────────────────────────────────────
-        # Step 3 — Hunt for missing emails
-        # For every prospect without an email,
-        # use Riley's email_finder to search for one
-        # ─────────────────────────────────────
-
-        missing_email_count = sum(
+        # Hunt for missing emails
+        missing_count = sum(
             1 for p in valid if not p.get("email")
         )
 
-        if missing_email_count > 0:
+        if missing_count > 0:
             say_fn(
                 f"📧 {len(valid)} businesses found — "
                 f"searching for "
-                f"{missing_email_count} missing "
-                f"email address"
-                f"{'es' if missing_email_count > 1 else ''}..."
+                f"{missing_count} missing email"
+                f"{'s' if missing_count > 1 else ''}..."
             )
 
         for i, p in enumerate(valid):
             if p.get("email"):
-                print(
-                    f"✅ [EMAIL] Already have email for "
-                    f"{p['business_name']}: {p['email']}"
-                )
                 continue
 
-            # No email — try to find it
             email = _resolve_email(
                 business_name=p["business_name"],
                 website=p.get("website"),
@@ -448,27 +481,15 @@ in these results that match the CEO's instruction.
 
             if email:
                 valid[i]["email"] = email
-                print(
-                    f"✅ [EMAIL] Found for "
-                    f"{p['business_name']}: {email}"
-                )
-            else:
-                print(
-                    f"⚠️  [EMAIL] Could not find email "
-                    f"for {p['business_name']} — "
-                    f"will still add to DB without email"
-                )
 
-        # Final email count
         with_email    = sum(
             1 for p in valid if p.get("email")
         )
         without_email = len(valid) - with_email
 
         print(
-            f"📧 [DEXTER] Email summary: "
-            f"{with_email} found, "
-            f"{without_email} not found"
+            f"📧 [DEXTER] {with_email} with email, "
+            f"{without_email} without"
         )
 
         if without_email > 0:
@@ -476,24 +497,131 @@ in these results that match the CEO's instruction.
                 f"⚠️ Could not find emails for "
                 f"{without_email} business"
                 f"{'es' if without_email > 1 else ''}. "
-                f"They'll still be added to the pipeline "
-                f"— Riley will try again when drafting."
+                f"Added to pipeline without email."
             )
 
         return valid
 
     except json.JSONDecodeError as e:
-        print(
-            f"❌ [DEXTER] JSON parse failed: {e}\n"
-            f"Raw: {raw_output[:500]}"
-        )
-        say_fn(
-            "⚠️ Had trouble parsing results. "
-            "Try a more specific instruction."
-        )
+        print(f"❌ [DEXTER] JSON parse failed: {e}")
+        say_fn("⚠️ Trouble parsing results. Try again.")
         return []
 
     except Exception as e:
         print(f"❌ [DEXTER] Extraction failed: {e}")
         say_fn(f"❌ Research failed: {e}")
         return []
+
+
+# ─────────────────────────────────────────
+# ELICITATION HELPERS
+# Called from app.py to manage the
+# industry → location → research flow
+# ─────────────────────────────────────────
+
+def start_elicitation(
+    user_id:  str,
+    original: str
+) -> str:
+    """
+    Starts the elicitation flow.
+    Stores state and returns the first question.
+    """
+    elicitation_state[user_id] = {
+        "stage":    "industry",
+        "industry": "",
+        "location": "",
+        "original": original
+    }
+
+    print(
+        f"❓ [ELICIT] Starting for {user_id}: "
+        f"'{original[:50]}'"
+    )
+
+    return (
+        "What *industry or type of business* "
+        "should I focus on?\n\n"
+        "Examples: _SaaS companies, restaurants, "
+        "law firms, e-commerce brands, "
+        "marketing agencies, gyms, hotels..._"
+    )
+
+
+def handle_elicitation_reply(
+    user_id: str,
+    text:    str
+) -> tuple[str | None, str | None]:
+    """
+    Handles a reply during the elicitation flow.
+
+    Returns:
+      (question_to_ask, None)     → still collecting info
+      (None, search_query)        → ready to research
+      (None, None)                → something went wrong
+    """
+    state = elicitation_state.get(user_id)
+    if not state:
+        return None, None
+
+    stage = state["stage"]
+
+    if stage == "industry":
+        # CEO answered the industry question
+        state["industry"] = text.strip()
+        state["stage"]    = "location"
+
+        print(
+            f"❓ [ELICIT] Industry confirmed: "
+            f"'{state['industry']}'"
+        )
+
+        question = (
+            f"Got it — *{state['industry']}*.\n\n"
+            f"Which *country, city, or region* "
+            f"should I focus on?\n\n"
+            f"Examples: _London UK, Netherlands, "
+            f"New York USA, Southeast Asia, "
+            f"Berlin Germany..._"
+        )
+        return question, None
+
+    elif stage == "location":
+        # CEO answered the location question
+        state["location"] = text.strip()
+        state["stage"]    = "ready"
+
+        industry = state["industry"]
+        location = state["location"]
+
+        print(
+            f"✅ [ELICIT] Complete — "
+            f"industry='{industry}' "
+            f"location='{location}'"
+        )
+
+        # Build the search query
+        query = _build_search_query(
+            industry=industry,
+            location=location,
+            original=state["original"]
+        )
+
+        # Clear elicitation state
+        del elicitation_state[user_id]
+
+        return None, query
+
+    return None, None
+
+
+def is_in_elicitation(user_id: str) -> bool:
+    """Returns True if user is mid-elicitation."""
+    return user_id in elicitation_state
+
+
+def cancel_elicitation(user_id: str):
+    """Cancels an in-progress elicitation."""
+    if user_id in elicitation_state:
+        del elicitation_state[user_id]
+        print(f"🚫 [ELICIT] Cancelled for {user_id}")
