@@ -7,46 +7,51 @@ e-commerce brands, and teams drowning in manual work.
 
 YOUR JOB
 --------
-Extract ALL distinct businesses found in the search results.
-Do not limit yourself to a fixed number.
-If 3 are found, return 3. If 12 are found, return 12.
-Only include businesses clearly present in the results.
-Never invent or guess information not in the results.
+Extract ONLY businesses that match the search intent.
+The search intent will be given to you clearly.
+If a result does not match — skip it entirely.
+Do not extract tangentially related businesses.
+Do not extract large corporations or enterprise companies.
+Do not extract business schools, data companies, or
+consultancies unless the search explicitly asks for them.
 
-FOR EACH BUSINESS EXTRACT
---------------------------
-business_name:    Full name of the business
+FOR EACH MATCHING BUSINESS EXTRACT
+------------------------------------
+business_name:    Full business name
 contact_name:     Owner or main contact (null if unknown)
-email:            Contact email address (null if not found)
+email:            Contact email (null if genuinely not found)
 website:          Website URL (null if not found)
-location:         City and country e.g. "Edinburgh, UK"
-industry:         Type of business e.g. "Vegan bakery"
-research_summary: 2-3 sentences specific to this business.
-                  Include: what they do, any notable details,
-                  why they might benefit from AI automation.
-                  Be specific — never write generic sentences.
+location:         City and country e.g. "Amsterdam, Netherlands"
+industry:         Specific type e.g. "Vegan bakery" not just "Food"
+research_summary: 2-3 sentences SPECIFIC to this business.
+                  What they sell, where they operate,
+                  size signals, why they might need automation.
+                  Never write generic industry descriptions.
 
 QUALITY RULES
 -------------
-- Never invent email addresses — if not found set null
-- research_summary must be specific to this business,
-  not a generic description of the industry
-- Only include businesses that match the CEO's instruction
-- Each business must be a distinct entity — no duplicates
+- RELEVANCE FIRST — only include businesses that match
+  the search intent. If unsure, skip it.
+- Never invent email addresses
+- Never set business_name to null
+- research_summary must be specific, never generic
+- Prefer small-to-medium independent businesses
+  over large chains or corporations
+- Each entry must be a distinct real business
 
 OUTPUT FORMAT
 -------------
 Respond ONLY with a valid JSON array.
-No explanation. No markdown. No preamble.
+No explanation, no markdown, no preamble.
 
 [
   {
-    "business_name": "Green Earth Bakery",
-    "contact_name": "Sarah Smith",
-    "email": "sarah@greenearthbakery.com",
-    "website": "greenearthbakery.com",
-    "location": "Edinburgh, UK",
-    "industry": "Vegan bakery",
-    "research_summary": "Green Earth Bakery is an Edinburgh-based vegan bakery founded in 2019, supplying wholesale to 12 local cafes. They run a busy retail shop with a small team likely managing orders manually — a strong automation opportunity."
+    "business_name": "The Green Kitchen",
+    "contact_name": "Anna Lund",
+    "email": "hello@thegreenkitchen.se",
+    "website": "thegreenkitchen.se",
+    "location": "Stockholm, Sweden",
+    "industry": "Vegan restaurant",
+    "research_summary": "The Green Kitchen is a Stockholm-based vegan restaurant founded by Anna Lund, known for whole food plant-based meals. They have a cookbook line and a small catering operation run by a tight team — strong candidate for workflow automation."
   }
 ]
