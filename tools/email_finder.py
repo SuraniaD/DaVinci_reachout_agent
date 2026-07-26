@@ -6,24 +6,23 @@ from interaction_log import log_action
 def extract_emails_from_text(text: str) -> list[str]:
     """
     Pulls any email addresses out of a block of text.
-    Used on search results to find contact emails.
     """
     pattern = r'[\w\.-]+@[\w\.-]+\.[a-zA-Z]{2,}'
     emails  = re.findall(pattern, text)
 
-    # Filter out obvious junk
     junk_domains = [
         "example.com", "test.com", "email.com",
         "domain.com", "yoursite.com", "sentry.io",
-        "wixpress.com", "shopify.com"
+        "wixpress.com", "shopify.com", "squarespace.com",
+        "wordpress.com", "mailchimp.com", "gmail.com"
     ]
     clean = [
         e.lower() for e in emails
         if not any(j in e.lower() for j in junk_domains)
     ]
 
-    # Deduplicate while preserving order
-    seen = set()
+    # Deduplicate preserving order
+    seen   = set()
     result = []
     for e in clean:
         if e not in seen:
@@ -34,14 +33,11 @@ def extract_emails_from_text(text: str) -> list[str]:
 
 
 def extract_domain_from_url(url: str) -> str:
-    """
-    Pulls the domain out of a URL string.
-    e.g. "https://veganleatherco.com" → "veganleatherco.com"
-    e.g. "veganleatherco.com" → "veganleatherco.com"
-    """
+    """Pulls the domain from a URL string."""
     url = url.strip().lower()
-    url = url.replace("https://", "").replace("http://", "")
-    url = url.replace("www.", "")
+    url = url.replace("https://", "") \
+             .replace("http://",  "") \
+             .replace("www.",     "")
     url = url.split("/")[0]
     return url
 
@@ -62,14 +58,14 @@ def is_url(text: str) -> bool:
 
 
 def is_social_media(text: str) -> bool:
-    """Returns True if text is a social media handle or link."""
-    social_keywords = [
-        "instagram", "twitter", "facebook", "linkedin",
-        "tiktok", "youtube", "@", "instagram only",
-        "social only", "ig:", "fb:"
+    """Returns True if text is a social media link."""
+    keywords = [
+        "instagram", "twitter", "facebook",
+        "linkedin", "tiktok", "youtube",
+        "@", "instagram only", "social only"
     ]
     text_lower = text.lower()
-    return any(k in text_lower for k in social_keywords)
+    return any(k in text_lower for k in keywords)
 
 
 def find_email_from_website(
@@ -77,19 +73,19 @@ def find_email_from_website(
     website_url:   str
 ) -> str | None:
     """
-    Given a business name and website URL,
-    searches the web to find a contact email.
+    Searches the web for an email address linked to
+    a specific business website.
+    Used by both Riley (file_reader) and Dexter (research).
 
     Strategy:
-    1. Search "[business name] contact email [domain]"
-    2. Extract any emails from search results
-    3. Prefer emails at the same domain as the website
-    4. Fall back to any email found
+    1. Search "[business] contact email [domain]"
+    2. Search "site:[domain] contact email"
+    3. Search "[business] hello@ OR contact@ OR info@"
     """
     domain = extract_domain_from_url(website_url)
 
     print(
-        f"🔎 [EMAIL FINDER] Searching for email — "
+        f"📧 [EMAIL FINDER] Searching via website — "
         f"{business_name} ({domain})"
     )
 
@@ -113,41 +109,40 @@ def find_email_from_website(
                 all_emails.extend(emails)
 
             if all_emails:
-                break  # Stop if we found something
+                break  # Stop at first successful query
 
         except Exception as e:
-            print(f"⚠️  [EMAIL FINDER] Search failed: {e}")
+            print(
+                f"⚠️  [EMAIL FINDER] "
+                f"Query failed: {e}"
+            )
             continue
 
     if not all_emails:
         print(
             f"❌ [EMAIL FINDER] No email found for "
-            f"{business_name}"
+            f"{business_name} via website"
         )
         return None
 
     # Prefer emails at the same domain
-    domain_emails = [
+    domain_clean   = domain.replace("www.", "")
+    domain_emails  = [
         e for e in all_emails
-        if domain.replace("www.", "") in e
+        if domain_clean in e
     ]
 
-    if domain_emails:
-        chosen = domain_emails[0]
-        print(
-            f"✅ [EMAIL FINDER] Found domain email: "
-            f"{chosen}"
-        )
-    else:
-        chosen = all_emails[0]
-        print(
-            f"✅ [EMAIL FINDER] Found email: {chosen}"
-        )
+    chosen = domain_emails[0] if domain_emails \
+        else all_emails[0]
+
+    print(
+        f"✅ [EMAIL FINDER] Found via website: {chosen}"
+    )
 
     log_action(
         action_type="email_found",
         business_name=business_name,
-        detail=f"Found {chosen} via web search"
+        detail=f"Found {chosen} via website search"
     )
 
     return chosen
@@ -158,16 +153,18 @@ def find_email_from_business_name(
     location:      str = None
 ) -> str | None:
     """
-    When there's no website URL — search for the
-    business by name and try to find a contact email.
+    Searches for an email when no website is available.
+    Uses business name + optional location.
+    Used by both Riley (file_reader) and Dexter (research).
     """
     query = f'"{business_name}" contact email'
     if location:
         query += f" {location}"
 
     print(
-        f"🔎 [EMAIL FINDER] Searching by name — "
+        f"📧 [EMAIL FINDER] Searching by name — "
         f"{business_name}"
+        f"{f' ({location})' if location else ''}"
     )
 
     try:
@@ -185,17 +182,23 @@ def find_email_from_business_name(
         if all_emails:
             chosen = all_emails[0]
             print(
-                f"✅ [EMAIL FINDER] Found: {chosen}"
+                f"✅ [EMAIL FINDER] "
+                f"Found by name: {chosen}"
             )
             log_action(
                 action_type="email_found",
                 business_name=business_name,
-                detail=f"Found {chosen} by name search"
+                detail=(
+                    f"Found {chosen} by name search"
+                )
             )
             return chosen
 
     except Exception as e:
-        print(f"⚠️  [EMAIL FINDER] Name search failed: {e}")
+        print(
+            f"⚠️  [EMAIL FINDER] "
+            f"Name search failed: {e}"
+        )
 
     print(
         f"❌ [EMAIL FINDER] No email found for "

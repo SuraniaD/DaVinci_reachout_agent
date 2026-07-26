@@ -8,25 +8,12 @@ from interaction_log import log_action
 
 load_dotenv()
 
-# ─────────────────────────────────────────
-# DEXTER USES KEY 1 — SEPARATE FROM RILEY
-# GROQ_API_KEY_DEXTER → Key 1
-# GROQ_API_KEY_RILEY  → Key 2 (in riley.py)
-# ─────────────────────────────────────────
-
 client = Groq(
     api_key=os.environ.get("GROQ_API_KEY_DEXTER")
 )
 
 RESEARCH_MODEL = "llama-3.3-70b-versatile"
 CHAT_MODEL     = "llama-3.1-8b-instant"
-
-# ─────────────────────────────────────────
-# DEXTER'S CORE IDENTITY — ~60 tokens only
-# No research rules here
-# No output format rules here
-# Those live in skill files
-# ─────────────────────────────────────────
 
 DEXTER_SYSTEM_PROMPT = """
 You are Dexter, Research Manager at DaVinci AI.
@@ -50,20 +37,12 @@ COMMANDS:
 - !resetrun               → cancel current session
 """
 
-# ─────────────────────────────────────────
-# DAILY TOKEN LIMITS
-# ─────────────────────────────────────────
-
 DAILY_LIMIT_70B = 100_000
 DAILY_LIMIT_8B  = 500_000
 
 session_tokens_research = 0
 session_tokens_chat     = 0
 
-
-# ─────────────────────────────────────────
-# TOKEN FOOTER
-# ─────────────────────────────────────────
 
 def _token_footer(
     tokens_this_call: int,
@@ -104,18 +83,10 @@ def _token_footer(
     )
 
 
-# ─────────────────────────────────────────
-# SKILL LOADER — same pattern as Riley
-# ─────────────────────────────────────────
-
 def _load_skill(filename: str) -> str:
     """
     Loads a skill file from the project root.
     Only called when that specific task runs.
-
-    Current Dexter skills:
-      research_skill.txt  → how to extract business data
-      prospects_skill.txt → how to format pipeline view
     """
     paths = [
         os.path.join(
@@ -155,17 +126,8 @@ research_summary: 2-3 sentences specific to this business.
 Never invent email addresses. Never set business_name to null.
 Respond ONLY with a JSON array, no explanation.
 """
-    if filename == "prospects_skill.txt":
-        return """
-Format prospect pipeline as a clean Slack summary.
-Group by status. Be concise. Use emojis for status.
-"""
     return ""
 
-
-# ─────────────────────────────────────────
-# GROQ CALL WITH RETRY
-# ─────────────────────────────────────────
 
 def _call_groq(
     messages:    list,
@@ -173,11 +135,6 @@ def _call_groq(
     max_tokens:  int,
     temperature: float = 0.7
 ) -> tuple[str, int]:
-    """
-    Calls Groq with automatic retry on rate limit.
-    Returns (content, tokens_used).
-    Works for both 70B research and 8B chat.
-    """
     for attempt in range(2):
         try:
             response = client.chat.completions.create(
@@ -206,21 +163,10 @@ def _call_groq(
             raise e
 
 
-# ─────────────────────────────────────────
-# GENERAL CHAT
-# Core identity prompt only — 8B model
-# No skill files loaded here
-# ─────────────────────────────────────────
-
 def chat_with_dexter(
     user_id:      str,
     user_message: str
 ) -> str:
-    """
-    General conversation with Dexter.
-    Uses core identity prompt only (~60 tokens).
-    No skill files loaded here.
-    """
     from memory import get_history, add_message
 
     history = get_history("dexter", user_id)
@@ -254,10 +200,71 @@ def chat_with_dexter(
 
 
 # ─────────────────────────────────────────
+# EMAIL RESOLUTION
+# Uses Riley's email_finder tools to find
+# missing emails for researched prospects
+# ─────────────────────────────────────────
+
+def _resolve_email(
+    business_name: str,
+    website:       str = None,
+    location:      str = None
+) -> str | None:
+    """
+    Tries to find an email for a business using
+    Riley's existing email_finder tools.
+
+    Priority order:
+    1. If website URL found — search for email at domain
+    2. If no website — search by business name + location
+    3. Return None if nothing found
+    """
+    from tools.email_finder import (
+        find_email_from_website,
+        find_email_from_business_name
+    )
+
+    print(
+        f"📧 [EMAIL RESOLVER] Looking for email: "
+        f"{business_name}"
+    )
+
+    # Strategy 1 — search via website domain
+    if website:
+        email = find_email_from_website(
+            business_name, website
+        )
+        if email:
+            print(
+                f"✅ [EMAIL RESOLVER] Found via website: "
+                f"{email}"
+            )
+            return email
+
+    # Strategy 2 — search by business name + location
+    email = find_email_from_business_name(
+        business_name, location
+    )
+    if email:
+        print(
+            f"✅ [EMAIL RESOLVER] Found via name search: "
+            f"{email}"
+        )
+        return email
+
+    print(
+        f"❌ [EMAIL RESOLVER] No email found for "
+        f"{business_name}"
+    )
+    return None
+
+
+# ─────────────────────────────────────────
 # RESEARCH BUSINESSES
 # Loads research_skill.txt — only here
-# Uses 70B model for better extraction
-# No chat history sent — not needed
+# Uses 70B model for extraction
+# Then hunts for missing emails using
+# Riley's email_finder tools
 # ─────────────────────────────────────────
 
 def research_businesses(
@@ -267,9 +274,13 @@ def research_businesses(
 ) -> list[dict]:
     """
     Researches businesses matching CEO instruction.
-    Loads research_skill.txt as system prompt.
-    Uses 70B for better structured data extraction.
-    Validates entries before returning.
+
+    Flow:
+    1. DuckDuckGo web search (zero tokens)
+    2. 70B model extracts structured business data
+    3. For any prospect missing email — email_finder
+       searches for it using website or business name
+    4. Returns validated list ready for DB insert
     """
     from tools.web_researcher import search_businesses
 
@@ -280,7 +291,7 @@ def research_businesses(
         f"_Searching the web..._"
     )
 
-    # Step 1 — Web search (no LLM, zero tokens)
+    # Step 1 — Web search, zero tokens
     raw_results = search_businesses(
         instruction, max_results=10
     )
@@ -289,17 +300,16 @@ def research_businesses(
         say_fn(
             "⚠️ No web results found.\n"
             "Try specific keywords — e.g.\n"
-            "_'plant based food brands Amsterdam Netherlands'_"
+            "_'plant based food brands Amsterdam "
+            "Netherlands'_"
         )
         return []
 
     say_fn("🧠 Extracting business details...")
 
-    # Step 2 — Load research skill
-    # Only loaded here — not in chat calls
+    # Step 2 — Load research skill (only here)
     research_skill = _load_skill("research_skill.txt")
 
-    # Step 3 — Build extraction task
     task = f"""
 CEO instruction: "{instruction}"
 
@@ -339,33 +349,27 @@ in these results that match the CEO's instruction.
             f"({pct:.1f}% of 70B daily limit)"
         )
 
-        # ── DEFENSIVE JSON PARSING ────────────
+        # Defensive JSON parsing
         clean = re.sub(
             r'```(?:json)?\n?|\n?```',
             '',
             raw_output.strip()
         )
-
-        # Find JSON array even if there's
-        # stray text before or after
         array_match = re.search(
-            r'\[.*\]',
-            clean,
-            re.DOTALL
+            r'\[.*\]', clean, re.DOTALL
         )
         if array_match:
             clean = array_match.group(0)
 
         raw_prospects = json.loads(clean)
 
-        # ── VALIDATE EACH ENTRY ───────────────
+        # Validate entries
         valid   = []
         invalid = []
 
         for p in raw_prospects:
             name = p.get("business_name")
 
-            # Skip null or placeholder names
             if not name or \
                str(name).strip().lower() in [
                    "none", "null", "unknown",
@@ -374,12 +378,11 @@ in these results that match the CEO's instruction.
                ]:
                 invalid.append(p)
                 print(
-                    f"⚠️  [DEXTER] Skipping — "
-                    f"no business name: {p}"
+                    f"⚠️  [DEXTER] No business name — "
+                    f"skipping"
                 )
                 continue
 
-            # Skip if no useful data at all
             has_data = any([
                 p.get("email"),
                 p.get("website"),
@@ -389,8 +392,8 @@ in these results that match the CEO's instruction.
             if not has_data:
                 invalid.append(p)
                 print(
-                    f"⚠️  [DEXTER] Skipping "
-                    f"'{name}' — no useful data"
+                    f"⚠️  [DEXTER] No useful data for "
+                    f"'{name}' — skipping"
                 )
                 continue
 
@@ -405,8 +408,76 @@ in these results that match the CEO's instruction.
             say_fn(
                 "⚠️ Found search results but couldn't "
                 "extract clean business data.\n"
-                "Try more specific keywords — e.g.\n"
-                "_'vegan food companies Netherlands'_"
+                "Try more specific keywords."
+            )
+            return []
+
+        # ─────────────────────────────────────
+        # Step 3 — Hunt for missing emails
+        # For every prospect without an email,
+        # use Riley's email_finder to search for one
+        # ─────────────────────────────────────
+
+        missing_email_count = sum(
+            1 for p in valid if not p.get("email")
+        )
+
+        if missing_email_count > 0:
+            say_fn(
+                f"📧 {len(valid)} businesses found — "
+                f"searching for "
+                f"{missing_email_count} missing "
+                f"email address"
+                f"{'es' if missing_email_count > 1 else ''}..."
+            )
+
+        for i, p in enumerate(valid):
+            if p.get("email"):
+                print(
+                    f"✅ [EMAIL] Already have email for "
+                    f"{p['business_name']}: {p['email']}"
+                )
+                continue
+
+            # No email — try to find it
+            email = _resolve_email(
+                business_name=p["business_name"],
+                website=p.get("website"),
+                location=p.get("location")
+            )
+
+            if email:
+                valid[i]["email"] = email
+                print(
+                    f"✅ [EMAIL] Found for "
+                    f"{p['business_name']}: {email}"
+                )
+            else:
+                print(
+                    f"⚠️  [EMAIL] Could not find email "
+                    f"for {p['business_name']} — "
+                    f"will still add to DB without email"
+                )
+
+        # Final email count
+        with_email    = sum(
+            1 for p in valid if p.get("email")
+        )
+        without_email = len(valid) - with_email
+
+        print(
+            f"📧 [DEXTER] Email summary: "
+            f"{with_email} found, "
+            f"{without_email} not found"
+        )
+
+        if without_email > 0:
+            say_fn(
+                f"⚠️ Could not find emails for "
+                f"{without_email} business"
+                f"{'es' if without_email > 1 else ''}. "
+                f"They'll still be added to the pipeline "
+                f"— Riley will try again when drafting."
             )
 
         return valid
