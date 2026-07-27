@@ -1,384 +1,1286 @@
-import re
-from tools.research import research_business
-from tools.email_sender import send_email
-from tools.prospect_db import (
-    save_draft,
-    update_draft_status,
-    update_prospect_status,
-    get_latest_draft
+import os
+import tempfile
+import threading
+
+from slack_bolt import App
+from slack_bolt.adapter.socket_mode import SocketModeHandler
+from slack_sdk import WebClient
+from dotenv import load_dotenv
+
+from memory import load_all_conversations, clear_history
+from agents.riley import chat_with_riley
+from agents.dexter import (
+    chat_with_dexter,
+    research_businesses,
+    is_in_elicitation,
+    handle_elicitation_reply,
+    start_elicitation,
+    cancel_elicitation,
+    _needs_elicitation
 )
-from agents.riley import draft_outreach_email, parse_draft
-from interaction_log import log_action
-from datetime import datetime, timezone
+from outreach_runner import (
+    process_prospect_from_db,
+    process_contact,
+    send_approved_email,
+    skip_contact,
+    save_redraft,
+    format_draft_for_slack,
+    generate_summary,
+    is_auto_mode,
+    set_auto_mode
+)
+from tools.file_reader import (
+    read_contact_list,
+    parse_pasted_table
+)
+from tools.run_state import (
+    save_run_state,
+    load_all_run_states,
+    clear_run_state
+)
+from tools.prospect_db import (
+    add_prospect,
+    get_prospects,
+    get_prospects_for_outreach,
+    get_prospect_by_name,
+    update_prospect_status,
+    start_research_session,
+    complete_research_session,
+    format_prospects_for_slack,
+    format_pipeline_summary_for_slack,
+    get_pipeline_summary
+)
+from interaction_log import (
+    log_action,
+    get_recent_logs,
+    format_logs_for_slack
+)
 
-auto_mode_settings = {}
+load_dotenv()
 
+# ─────────────────────────────────────────
+# TWO SLACK APPS — RILEY AND DEXTER
+# Same Railway process, separate bot tokens
+# ─────────────────────────────────────────
 
-def is_auto_mode(user_id: str) -> bool:
-    return auto_mode_settings.get(user_id, False)
+riley_app = App(
+    token=os.environ.get("RILEY_BOT_TOKEN"),
+    signing_secret=os.environ.get("RILEY_SIGNING_SECRET")
+)
 
+dexter_app = App(
+    token=os.environ.get("DEXTER_BOT_TOKEN"),
+    signing_secret=os.environ.get("DEXTER_SIGNING_SECRET")
+)
 
-def set_auto_mode(user_id: str, value: bool):
-    auto_mode_settings[user_id] = value
-    mode = "AUTO-SEND" if value else "APPROVAL"
-    print(f"⚙️  [MODE] {mode} for {user_id}")
+riley_client = WebClient(
+    token=os.environ.get("RILEY_BOT_TOKEN")
+)
 
+dexter_client = WebClient(
+    token=os.environ.get("DEXTER_BOT_TOKEN")
+)
 
-def process_prospect_from_db(
-    user_id:   str,
-    prospect:  dict,
-    say_fn
-) -> dict | None:
-    """
-    Processes one prospect from the DB.
-    Uses research_summary and email already in DB —
-    no web search needed (Dexter already did it).
+# ─────────────────────────────────────────
+# RILEY APPROVAL STATE
+# ─────────────────────────────────────────
 
-    Returns result dict or None if something went wrong.
-    """
-    name          = prospect.get("contact_name") or \
-                    prospect.get("business_name", "")
-    business      = prospect.get("business_name", "")
-    email         = prospect.get("email", "")
-    prospect_id   = prospect.get("id")
-    research_sum  = prospect.get("research_summary", "")
-    location      = prospect.get("location", "")
-    industry      = prospect.get("industry", "")
-
-    # Build rich context from all DB fields
-    extra_context = ""
-    if location:
-        extra_context += f"Location: {location}\n"
-    if industry:
-        extra_context += f"Industry: {industry}\n"
-
-    full_research = ""
-    if extra_context:
-        full_research += (
-            f"Context from prospect list:\n"
-            f"{extra_context}\n"
-        )
-    if research_sum:
-        full_research += (
-            f"Research summary:\n{research_sum}"
-        )
-
-    if not full_research:
-        full_research = (
-            f"Business: {business}. "
-            f"Write a warm, general outreach email."
-        )
-
-    try:
-        say_fn(
-            f"✍️ Drafting email for "
-            f"*{name}* at *{business}*..."
-        )
-
-        draft = draft_outreach_email(
-            user_id=user_id,
-            contact_name=name,
-            business_name=business,
-            research=full_research
-        )
-
-        subject, body = parse_draft(draft)
-
-        # Save draft to email_drafts table
-        draft_row = save_draft(
-            prospect_id=prospect_id,
-            subject=subject,
-            body=body,
-            version=1,
-            status="pending"
-        )
-
-        # Update prospect status → draft_ready
-        update_prospect_status(
-            prospect_id=prospect_id,
-            status="draft_ready"
-        )
-
-        draft_id = draft_row["id"] if draft_row else None
-
-        print(
-            f"✅ [OUTREACH] Draft saved for "
-            f"{business} (draft_id={draft_id})"
-        )
-
-        return {
-            "contact": {
-                "name":          name,
-                "business_name": business,
-                "email":         email,
-                "prospect_id":   prospect_id
-            },
-            "draft":    draft,
-            "subject":  subject,
-            "body":     body,
-            "draft_id": draft_id
-        }
-
-    except Exception as e:
-        say_fn(
-            f"⚠️ Error drafting for *{business}*: "
-            f"{e}. Skipping."
-        )
-        log_action(
-            action_type="error",
-            contact_name=name,
-            business_name=business,
-            detail=str(e)
-        )
-        return None
+approval_state = {}
 
 
-def process_contact(
-    user_id: str,
-    contact: dict,
-    say_fn
-) -> dict | None:
-    """
-    Legacy handler for CSV-uploaded contacts.
-    Still used when Riley receives a file upload.
-    Does web research since contact came from CSV.
-    """
-    name          = contact.get("name", "")
-    business      = contact.get("business_name", "")
-    email         = contact.get("email", "")
-    extra_context = contact.get("extra_context", "")
+# ─────────────────────────────────────────
+# DOWNLOAD FILE FROM SLACK
+# ─────────────────────────────────────────
 
-    try:
-        say_fn(f"🔍 Researching *{business}*...")
-        research = research_business(business)
-
-        say_fn(
-            f"✍️ Drafting email for "
-            f"*{name}* at *{business}*..."
-        )
-
-        full_research = ""
-        if extra_context:
-            full_research += (
-                f"Context:\n{extra_context}\n\n"
-            )
-        full_research += f"Web research:\n{research}"
-
-        draft = draft_outreach_email(
-            user_id=user_id,
-            contact_name=name,
-            business_name=business,
-            research=full_research
-        )
-
-        subject, body = parse_draft(draft)
-
-        return {
-            "contact": contact,
-            "draft":   draft,
-            "subject": subject,
-            "body":    body,
-            "draft_id": None  # No DB prospect for CSV
-        }
-
-    except Exception as e:
-        say_fn(
-            f"⚠️ Error processing *{name}* "
-            f"at *{business}*: {e}. Skipping."
-        )
-        log_action(
-            action_type="error",
-            contact_name=name,
-            business_name=business,
-            detail=str(e)
-        )
-        return None
-
-
-def send_approved_email(result: dict) -> bool:
-    """
-    Sends the email for an approved result.
-    Updates draft status to sent.
-    Updates prospect status to sent.
-    """
-    contact  = result["contact"]
-    draft_id = result.get("draft_id")
-
-    success = send_email(
-        to_email=contact["email"],
-        subject=result["subject"],
-        body=result["body"],
-        contact_name=contact["name"],
-        business_name=contact["business_name"]
+def download_slack_file(
+    file_info: dict,
+    bot_token: str
+) -> str:
+    import requests
+    file_url  = file_info["url_private_download"]
+    file_name = file_info["name"]
+    headers   = {"Authorization": f"Bearer {bot_token}"}
+    response  = requests.get(file_url, headers=headers)
+    suffix    = (
+        ".csv" if file_name.endswith(".csv") else ".xlsx"
     )
+    with tempfile.NamedTemporaryFile(
+        delete=False, suffix=suffix
+    ) as tmp:
+        tmp.write(response.content)
+        return tmp.name
 
-    if success and draft_id:
-        # Mark draft as sent
-        update_draft_status(
-            draft_id=draft_id,
-            status="sent",
-            sent_at=datetime.now(
-                timezone.utc
-            ).isoformat()
+
+# ═══════════════════════════════════════════
+# DEXTER — RESEARCH RUNNER
+# ═══════════════════════════════════════════
+
+def _run_research(
+    user_id:     str,
+    instruction: str,
+    say,
+    industry:    str = None,
+    location:    str = None
+):
+    """
+    Runs Dexter's research in a background thread.
+    industry and location passed from elicitation.
+    """
+    def _run():
+        session_id = start_research_session(
+            user_id, instruction
         )
-        # Mark prospect as sent
-        prospect_id = contact.get("prospect_id")
-        if prospect_id:
-            update_prospect_status(
-                prospect_id=prospect_id,
-                status="sent"
+
+        try:
+            prospects = research_businesses(
+                user_id=user_id,
+                instruction=instruction,
+                say_fn=say,
+                industry=industry,
+                location=location
             )
 
-    return success
+            if not prospects:
+                complete_research_session(
+                    session_id, 0, "failed"
+                )
+                return
+
+            added      = []
+            duplicates = []
+            invalid    = []
+
+            for p in prospects:
+                p["source_query"] = instruction
+                result = add_prospect(p)
+
+                if result:
+                    added.append(p["business_name"])
+                else:
+                    name = p.get("business_name", "")
+                    if name and name.lower() not in [
+                        "none", "null", "unknown",
+                        "", "n/a", "not found"
+                    ]:
+                        duplicates.append(name)
+                    else:
+                        invalid.append(str(p))
+
+            complete_research_session(
+                session_id, len(added)
+            )
+
+            if not added and not duplicates:
+                say(
+                    "⚠️ No valid businesses added.\n"
+                    "Try more specific keywords."
+                )
+                return
+
+            lines = [
+                f"✅ *Research complete:* "
+                f"_{instruction}_\n"
+            ]
+
+            if added:
+                lines.append(
+                    f"*Added {len(added)} "
+                    f"new prospect"
+                    f"{'s' if len(added) > 1 else ''}:*"
+                )
+                for name in added:
+                    p_data = get_prospect_by_name(name)
+                    email  = (
+                        p_data.get("email") or "no email"
+                        if p_data else "no email"
+                    )
+                    loc = (
+                        p_data.get("location") or ""
+                        if p_data else ""
+                    )
+                    line = f"  🔬 *{name}*"
+                    if loc:
+                        line += f" — {loc}"
+                    line += f"\n     {email}"
+                    lines.append(line)
+
+            if duplicates:
+                lines.append(
+                    f"\n*Already in DB "
+                    f"({len(duplicates)}):*"
+                )
+                for name in duplicates:
+                    lines.append(f"  • {name}")
+
+            if invalid:
+                lines.append(
+                    f"\n_{len(invalid)} entries "
+                    f"had no business name — skipped_"
+                )
+
+            lines.append(
+                f"\n_Tell Riley *!run* to start "
+                f"drafting emails for these prospects._"
+            )
+
+            say("\n\n".join(lines))
+
+            log_action(
+                action_type="research",
+                detail=(
+                    f"Dexter: '{instruction}' — "
+                    f"{len(added)} added"
+                )
+            )
+
+        except Exception as e:
+            print(f"💥 [DEXTER] Run failed: {e}")
+            say(f"❌ Research failed: {e}")
+            if session_id:
+                complete_research_session(
+                    session_id, 0, "failed"
+                )
+
+    thread = threading.Thread(target=_run)
+    thread.daemon = True
+    thread.start()
 
 
-def skip_contact(result: dict, feedback: str = None):
+# ═══════════════════════════════════════════
+# DEXTER EVENT HANDLER
+# ═══════════════════════════════════════════
+
+@dexter_app.event("message")
+def handle_dexter_dm(event, say):
     """
-    Records a skipped/rejected draft.
-    Prospect stays at draft_ready — can be retried.
-    Draft marked as rejected.
+    Central handler for all Dexter Slack DMs.
+
+    Routing order:
+    1. Ignore bot messages
+    2. DMs only
+    3. Commands (!prospects, !add, !research, !resetrun)
+    4. Mid-elicitation reply
+    5. Research intent → elicitation or direct
+    6. General chat
     """
-    contact  = result["contact"]
-    draft_id = result.get("draft_id")
+    if event.get("bot_id"):
+        return
+    if event.get("channel_type") != "im":
+        return
 
-    if draft_id:
-        update_draft_status(
-            draft_id=draft_id,
-            status="rejected",
-            feedback=feedback
-        )
-        # Prospect stays at draft_ready
-        # so CEO can retry later with !run draft_ready
-
-    log_action(
-        action_type="skipped",
-        contact_name=contact.get("name"),
-        business_name=contact.get("business_name"),
-        detail=(
-            f"Skipped — draft_id={draft_id}"
-            f"{f', feedback: {feedback}' if feedback else ''}"
-        )
-    )
+    user_id = event["user"]
+    text    = event.get("text", "").strip()
 
     print(
-        f"⏭️  Skipped {contact.get('name')} "
-        f"@ {contact.get('business_name')}"
+        f"\n🔬 [DEXTER DM] {user_id}: "
+        f"'{text[:60]}{'...' if len(text) > 60 else ''}'"
     )
 
-
-def save_redraft(
-    result:  dict,
-    subject: str,
-    body:    str,
-    draft:   str
-) -> dict:
-    """
-    Saves a new draft version after CEO feedback.
-    Creates a new email_drafts row with version + 1.
-    """
-    contact     = result["contact"]
-    prospect_id = contact.get("prospect_id")
-
-    if prospect_id:
-        # Get current version number
-        existing = get_latest_draft(prospect_id)
-        version  = (existing["version"] + 1) \
-            if existing else 1
-
-        # Mark old draft as rejected
-        old_draft_id = result.get("draft_id")
-        if old_draft_id:
-            update_draft_status(
-                draft_id=old_draft_id,
-                status="rejected"
-            )
-
-        # Save new draft version
-        new_draft_row = save_draft(
-            prospect_id=prospect_id,
-            subject=subject,
-            body=body,
-            version=version,
-            status="pending"
+    if is_in_elicitation(user_id):
+        print(
+            f"   [ELICIT STATE] Active for {user_id}"
         )
 
-        new_draft_id = (
-            new_draft_row["id"]
-            if new_draft_row else None
-        )
+    # ── !prospects ────────────────────────
+    if text.lower().startswith("!prospects"):
+        cancel_elicitation(user_id)
+        parts  = text.lower().split()
+        status = parts[1] if len(parts) > 1 else None
 
         print(
-            f"✅ [OUTREACH] Redraft saved — "
-            f"v{version} "
-            f"(draft_id={new_draft_id})"
+            f"📋 [DEXTER CMD] !prospects "
+            f"status={status}"
         )
 
-        return {
-            "contact":  contact,
-            "draft":    draft,
-            "subject":  subject,
-            "body":     body,
-            "draft_id": new_draft_id
+        prospects = get_prospects(
+            status=status, limit=20
+        )
+        title = (
+            f"📋 Prospects — {status}"
+            if status else
+            "📋 Prospect Pipeline"
+        )
+        say(format_prospects_for_slack(prospects, title))
+        return
+
+    # ── !resetrun ─────────────────────────
+    if text.lower() == "!resetrun":
+        cancel_elicitation(user_id)
+        say("🗑️ Research session cancelled.")
+        return
+
+    # ── !add <business> ──────────────────
+    if text.lower().startswith("!add "):
+        cancel_elicitation(user_id)
+        business_query = text[5:].strip()
+
+        if not business_query:
+            say(
+                "⚠️ Tell me which business to add.\n"
+                "Example: *!add Monzo London UK*"
+            )
+            return
+
+        print(
+            f"➕ [DEXTER CMD] !add: '{business_query}'"
+        )
+        _run_research(
+            user_id=user_id,
+            instruction=business_query,
+            say=say
+        )
+        return
+
+    # ── !research <query> ─────────────────
+    if text.lower().startswith("!research "):
+        cancel_elicitation(user_id)
+        query = text[10:].strip()
+
+        if not query:
+            say(
+                "⚠️ Example: "
+                "*!research SaaS startups London UK*"
+            )
+            return
+
+        print(
+            f"🔬 [DEXTER CMD] !research: '{query}'"
+        )
+
+        if _needs_elicitation(query):
+            reply = start_elicitation(user_id, query)
+            say(reply)
+        else:
+            _run_research(
+                user_id=user_id,
+                instruction=query,
+                say=say
+            )
+        return
+
+    # ── MID-ELICITATION REPLY ─────────────
+    if is_in_elicitation(user_id):
+        print(
+            f"❓ [DEXTER] Elicitation reply: '{text}'"
+        )
+
+        question, query, industry, location = \
+            handle_elicitation_reply(user_id, text)
+
+        if question:
+            say(question)
+
+        elif query:
+            say(
+                f"✅ Got it — searching for "
+                f"*{industry}* businesses "
+                f"in *{location}*..."
+            )
+            _run_research(
+                user_id=user_id,
+                instruction=query,
+                say=say,
+                industry=industry,
+                location=location
+            )
+
+        return
+
+    # ── RESEARCH INTENT DETECTION ─────────
+    research_signals = [
+        "find", "search", "look for", "research",
+        "get me", "i need", "can you find",
+        "businesses", "companies", "shops",
+        "cafes", "bakeries", "agencies",
+        "startups", "brands", "stores",
+        "clients", "leads", "prospects"
+    ]
+    text_lower         = text.lower()
+    is_research_intent = any(
+        s in text_lower for s in research_signals
+    )
+
+    if is_research_intent:
+        print(f"🔬 [DEXTER] Research intent detected")
+
+        if _needs_elicitation(text):
+            reply = start_elicitation(user_id, text)
+            say(reply)
+        else:
+            _run_research(
+                user_id=user_id,
+                instruction=text,
+                say=say
+            )
+        return
+
+    # ── GENERAL CHAT ─────────────────────
+    print(f"💬 [DEXTER] → general chat")
+    say("_Thinking..._")
+    reply = chat_with_dexter(user_id, text)
+    say(reply)
+
+
+# ═══════════════════════════════════════════
+# RILEY — HELPERS
+# ═══════════════════════════════════════════
+
+def _persist_state(user_id: str):
+    """Saves current run state to Supabase."""
+    if user_id not in approval_state:
+        return
+    state = approval_state[user_id]
+    save_run_state(
+        user_id=user_id,
+        remaining=state["remaining_contacts"],
+        stats=state["stats"]
+    )
+
+
+def start_outreach_run(
+    user_id:  str,
+    contacts: list[dict],
+    say,
+    source:   str = "csv"
+):
+    """
+    Starts an outreach run.
+    source='db'  → prospects from Supabase (Dexter)
+    source='csv' → contacts from file upload
+    """
+    print(
+        f"🚀 [RILEY] Run ({source}) for {user_id} — "
+        f"{len(contacts)} contacts"
+    )
+    clear_run_state(user_id)
+
+    mode_msg = (
+        "⚡ *Auto-send mode is ON* — "
+        "I'll send emails without asking for approval."
+        if is_auto_mode(user_id)
+        else
+        "✋ *Approval mode is ON* — "
+        "I'll show each draft and wait for "
+        "*approve* or *skip* before doing anything."
+    )
+
+    say(
+        f"✅ Starting outreach for "
+        f"*{len(contacts)} prospects*.\n\n"
+        f"{mode_msg}\n\n"
+        f"_Type *!automode on/off* to switch._"
+    )
+
+    approval_state[user_id] = {
+        "pending_result":     None,
+        "remaining_contacts": list(contacts),
+        "waiting":            False,
+        "source":             source,
+        "stats": {
+            "sent":    0,
+            "skipped": 0,
+            "failed":  0
         }
-
-    return {
-        "contact":  contact,
-        "draft":    draft,
-        "subject":  subject,
-        "body":     body,
-        "draft_id": None
     }
+    _persist_state(user_id)
+    process_next_contact(user_id, say)
 
 
-def format_draft_for_slack(result: dict) -> str:
+def post_draft_for_approval(
+    user_id: str,
+    result:  dict,
+    say
+):
+    """Posts draft to Slack and sets waiting=True."""
+    if user_id not in approval_state:
+        return
+    approval_state[user_id]["pending_result"] = result
+    approval_state[user_id]["waiting"]        = True
+    contact = result["contact"]
+    print(
+        f"✋ [RILEY] Waiting: "
+        f"{contact['name']} @ {contact['business_name']}"
+    )
+    say(format_draft_for_slack(result))
+
+
+def process_next_contact(user_id: str, say):
     """
-    Formats a draft into a clean Slack approval message.
-    Strips HTML tags and token footer for clean preview.
+    Picks next contact/prospect and processes it.
+    DB prospects: use research_summary, skip if no email.
+    CSV contacts: do web research.
+    Always runs in background thread.
     """
+    def _run():
+        if user_id not in approval_state:
+            return
+
+        state     = approval_state[user_id]
+        remaining = state["remaining_contacts"]
+        stats     = state["stats"]
+        source    = state.get("source", "csv")
+
+        print(
+            f"📋 [RILEY LOOP] "
+            f"{len(remaining)} remaining for {user_id} "
+            f"(source={source})"
+        )
+
+        if not remaining:
+            total = (
+                stats["sent"] +
+                stats["skipped"] +
+                stats["failed"]
+            )
+            say(generate_summary(
+                total=total,
+                sent=stats["sent"],
+                skipped=stats["skipped"],
+                failed=stats["failed"]
+            ))
+            clear_run_state(user_id)
+            del approval_state[user_id]
+            return
+
+        contact = remaining.pop(0)
+
+        biz_name = (
+            contact.get("business_name") or
+            contact.get("name", "unknown")
+        )
+        print(
+            f"▸  [RILEY LOOP] Processing: {biz_name}"
+        )
+
+        # ── ROUTE TO CORRECT PROCESSOR ────
+        if source == "db":
+            # DB prospect — skip if no email before draft
+            email = contact.get("email", "")
+            if not email or \
+               str(email).strip().lower() in [
+                   "", "none", "null",
+                   "n/a", "not found"
+               ]:
+                # Count as skipped, not failed
+                stats["skipped"] += 1
+                _persist_state(user_id)
+                say(
+                    f"⏭️ Skipping *{biz_name}* — "
+                    f"no email in DB.\n"
+                    f"_Ask Dexter to find the email._"
+                )
+                t = threading.Thread(
+                    target=process_next_contact,
+                    args=(user_id, say)
+                )
+                t.daemon = True
+                t.start()
+                return
+
+            result = process_prospect_from_db(
+                user_id=user_id,
+                prospect=contact,
+                say_fn=say
+            )
+        else:
+            # CSV contact — do web research
+            result = process_contact(
+                user_id=user_id,
+                contact=contact,
+                say_fn=say
+            )
+
+        if result is None:
+            # process functions return None for both
+            # errors and no-email skips —
+            # the function already posted in Slack
+            if source == "db":
+                stats["skipped"] += 1
+            else:
+                stats["failed"] += 1
+            _persist_state(user_id)
+            t = threading.Thread(
+                target=process_next_contact,
+                args=(user_id, say)
+            )
+            t.daemon = True
+            t.start()
+            return
+
+        if is_auto_mode(user_id):
+            contact_info = result["contact"]
+            success = send_approved_email(result)
+            if success:
+                stats["sent"] += 1
+                print(
+                    f"✅ [RILEY AUTO] Sent to "
+                    f"{contact_info['email']}"
+                )
+                say(
+                    f"✅ Sent to "
+                    f"*{contact_info['name']}* "
+                    f"at "
+                    f"*{contact_info['business_name']}*"
+                )
+            else:
+                stats["failed"] += 1
+                print(
+                    f"❌ [RILEY AUTO] Failed: "
+                    f"{contact_info['email']}"
+                )
+                say(
+                    f"❌ Failed: "
+                    f"*{contact_info['name']}*. "
+                    f"Moving on."
+                )
+            _persist_state(user_id)
+            t = threading.Thread(
+                target=process_next_contact,
+                args=(user_id, say)
+            )
+            t.daemon = True
+            t.start()
+        else:
+            _persist_state(user_id)
+            post_draft_for_approval(user_id, result, say)
+
+    thread = threading.Thread(target=_run)
+    thread.daemon = True
+    thread.start()
+
+
+def handle_file_upload(
+    event:   dict,
+    say,
+    user_id: str
+):
+    """Handles CSV/Excel uploaded to Riley's DM."""
+    file_info = event["files"][0]
+    file_name = file_info.get("name", "")
+
+    print(
+        f"📂 [RILEY] {user_id} uploaded: {file_name}"
+    )
+
+    if not file_name.endswith(
+        (".csv", ".xlsx", ".xls")
+    ):
+        say("⚠️ Please upload a .csv or .xlsx file.")
+        return
+
+    say(
+        f"📂 Got *{file_name}* — "
+        f"reading contacts and looking up emails..."
+    )
+
+    try:
+        print("⬇️  [RILEY] Downloading file...")
+        file_path = download_slack_file(
+            file_info,
+            os.environ.get("RILEY_BOT_TOKEN")
+        )
+        print(f"✅ [RILEY] Downloaded: {file_path}")
+
+        result = read_contact_list(file_path, user_id)
+
+        if isinstance(result, tuple):
+            contacts, skipped = result
+        else:
+            contacts = result
+            skipped  = []
+
+        print(
+            f"✅ [RILEY] {len(contacts)} contacts, "
+            f"{len(skipped)} skipped"
+        )
+
+        if skipped:
+            skipped_lines = "\n".join(
+                [f"  • {s}" for s in skipped[:10]]
+            )
+            if len(skipped) > 10:
+                skipped_lines += (
+                    f"\n  • ...and "
+                    f"{len(skipped) - 10} more"
+                )
+            say(
+                f"⚠️ *Could not find emails for "
+                f"{len(skipped)} contacts:*\n"
+                f"{skipped_lines}"
+            )
+
+        if not contacts:
+            say("❌ No contacts with emails found.")
+            return
+
+        start_outreach_run(
+            user_id=user_id,
+            contacts=contacts,
+            say=say,
+            source="csv"
+        )
+
+    except ValueError as e:
+        print(f"❌ [RILEY] ValueError: {e}")
+        say(f"⚠️ Problem with file: {e}")
+    except Exception as e:
+        print(f"💥 [RILEY] File error: {e}")
+        say(f"❌ Something went wrong: {e}")
+        log_action(
+            action_type="error",
+            detail=f"File upload error: {str(e)}"
+        )
+
+
+def handle_approval_reply(
+    user_id: str,
+    text:    str,
+    say
+):
+    """
+    Handles reply when Riley is waiting for approval.
+    approve → send, skip → skip, else → redraft.
+    """
+    state   = approval_state[user_id]
+    result  = state["pending_result"]
+    stats   = state["stats"]
     contact = result["contact"]
 
-    clean_body = re.sub(r'<[^>]+>', '', result["body"])
-
-    divider = "─────────────────────"
-    if divider in clean_body:
-        clean_body = clean_body[
-            :clean_body.index(divider)
-        ].strip()
-
-    clean_body = clean_body.strip()
-
-    email_line = (
-        f"*To:* {contact['email']}"
-        if contact.get("email")
-        else "*To:* ⚠️ no email — will skip sending"
+    print(
+        f"📨 [RILEY REPLY] '{text}' for "
+        f"{contact['name']} @ {contact['business_name']}"
     )
 
-    return (
-        f"📩 *Draft for {contact['name']} "
-        f"at {contact['business_name']}*\n"
-        f"{email_line}\n"
-        f"*Subject:* {result['subject']}\n\n"
-        f"{clean_body}\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"Reply *approve* to send · "
-        f"*skip* to skip · "
-        f"or describe changes to redraft"
-    )
+    # Clear waiting flag immediately
+    state["waiting"]        = False
+    state["pending_result"] = None
+    print(f"🔓 [RILEY] waiting cleared for {user_id}")
+
+    # ── APPROVE ──────────────────────────
+    if text.lower().strip() == "approve":
+        print(
+            f"✅ [RILEY] Sending to {contact['email']}"
+        )
+        success = send_approved_email(result)
+        if success:
+            stats["sent"] += 1
+            print(
+                f"✅ [RILEY] Sent → {contact['email']}"
+            )
+            say(
+                f"✅ Sent to *{contact['name']}* "
+                f"at *{contact['business_name']}*. "
+                f"Moving to next contact..."
+            )
+        else:
+            stats["failed"] += 1
+            print(
+                f"❌ [RILEY] Failed: {contact['email']}"
+            )
+            say(
+                "❌ Send failed. "
+                "Moving to next contact..."
+            )
+        _persist_state(user_id)
+        process_next_contact(user_id, say)
+        return
+
+    # ── SKIP ─────────────────────────────
+    if text.lower().strip() == "skip":
+        print(
+            f"⏭️  [RILEY] Skipping {contact['name']}"
+        )
+        skip_contact(result)
+        stats["skipped"] += 1
+        say(
+            f"⏭️ Skipped *{contact['name']}*. "
+            f"Moving to next contact...\n"
+            f"_This draft is saved — type "
+            f"*!run draft_ready* to retry later._"
+        )
+        _persist_state(user_id)
+        process_next_contact(user_id, say)
+        return
+
+    # ── REDRAFT ───────────────────────────
+    print(f"✏️  [RILEY] Redraft: '{text[:80]}'")
+    say("Got it — redrafting with your feedback...")
+
+    from agents.riley import parse_draft
+
+    try:
+        feedback_task = (
+            f"CEO feedback: \"{text}\"\n\n"
+            f"Original draft:\n{result['draft']}\n\n"
+            f"Redraft with this feedback. "
+            f"Keep SUBJECT then BODY format."
+        )
+        new_draft             = chat_with_riley(
+            user_id, feedback_task
+        )
+        new_subject, new_body = parse_draft(new_draft)
+
+        print(
+            f"✅ [RILEY] Redraft ready for "
+            f"{contact['name']}"
+        )
+
+        # Save new version to DB
+        new_result = save_redraft(
+            result=result,
+            subject=new_subject,
+            body=new_body,
+            draft=new_draft
+        )
+
+        post_draft_for_approval(
+            user_id, new_result, say
+        )
+
+    except Exception as e:
+        print(f"💥 [RILEY] Redraft failed: {e}")
+        say(
+            f"⚠️ Redraft failed: {e}\n"
+            f"Reply *approve* to send the original "
+            f"or *skip* to skip this contact."
+        )
+        # Restore original so approve/skip still work
+        state["pending_result"] = result
+        state["waiting"]        = True
+        print(
+            f"🔒 [RILEY] Restored waiting for {user_id}"
+        )
 
 
-def generate_summary(
-    total:   int,
-    sent:    int,
-    skipped: int,
-    failed:  int
-) -> str:
-    return (
-        f"✅ *Outreach run complete*\n\n"
-        f"📊 *Results:*\n"
-        f"• Total processed: {total}\n"
-        f"• Emails sent:     {sent}\n"
-        f"• Skipped:         {skipped}\n"
-        f"• Failed:          {failed}\n\n"
-        f"_Type *!pipeline* to see the full "
-        f"prospect pipeline._"
+# ═══════════════════════════════════════════
+# RILEY EVENT HANDLER
+# ═══════════════════════════════════════════
+
+@riley_app.event("message")
+def handle_riley_dm(event, say):
+    """
+    Central handler for all Riley Slack DMs.
+
+    Routing order:
+    1. Ignore bot messages
+    2. DMs only
+    3. File upload
+    4. !run — start DB outreach
+    5. !pipeline — show pipeline
+    6. !mark — update prospect status
+    7. Other commands
+    8. Approval reply (waiting flag)
+    9. Pasted table
+    10. General chat
+    """
+    if event.get("bot_id"):
+        return
+    if event.get("channel_type") != "im":
+        return
+
+    user_id = event["user"]
+    text    = event.get("text", "").strip()
+
+    print(
+        f"\n📧 [RILEY DM] {user_id}: "
+        f"'{text[:60]}{'...' if len(text) > 60 else ''}'"
     )
+
+    if user_id in approval_state:
+        s = approval_state[user_id]
+        print(
+            f"   [STATE] waiting={s.get('waiting')} "
+            f"remaining="
+            f"{len(s.get('remaining_contacts', []))}"
+        )
+
+    # ── FILE UPLOAD ──────────────────────
+    if event.get("files"):
+        print(f"📎 [RILEY] File upload from {user_id}")
+        handle_file_upload(event, say, user_id)
+        return
+
+    # ── !run ─────────────────────────────
+    # Start outreach from DB prospects
+    if text.lower().startswith("!run"):
+        parts  = text.lower().split()
+        status = parts[1] if len(parts) > 1 \
+            else "researched"
+
+        valid_statuses = ["researched", "draft_ready"]
+        if status not in valid_statuses:
+            say(
+                f"⚠️ Unknown status '{status}'.\n"
+                f"Use: *!run* or *!run draft_ready*"
+            )
+            return
+
+        print(
+            f"🚀 [RILEY CMD] !run status={status}"
+        )
+
+        prospects = get_prospects_for_outreach(
+            status=status,
+            limit=50
+        )
+
+        if not prospects:
+            status_label = status.replace("_", " ")
+            say(
+                f"📋 No prospects with status "
+                f"*{status_label}* found.\n\n"
+                f"• Ask Dexter to research businesses: "
+                f"DM Dexter and say what to find\n"
+                f"• Or upload a CSV file to start "
+                f"outreach manually"
+            )
+            return
+
+        # Count with/without email
+        with_email    = [
+            p for p in prospects
+            if p.get("email") and
+            str(p.get("email", "")).strip().lower()
+            not in ["", "none", "null", "n/a"]
+        ]
+        without_email = len(prospects) - len(with_email)
+
+        msg_parts = [
+            f"✅ Found *{len(prospects)} prospects* "
+            f"with status _{status.replace('_', ' ')}_."
+        ]
+
+        if without_email > 0:
+            msg_parts.append(
+                f"⚠️ *{without_email}* have no email "
+                f"and will be skipped automatically."
+            )
+
+        if not with_email:
+            say(
+                "⚠️ None of the prospects have "
+                "email addresses.\n"
+                "Ask Dexter to find emails first."
+            )
+            return
+
+        msg_parts.append("Starting drafting now...")
+        say("\n".join(msg_parts))
+
+        start_outreach_run(
+            user_id=user_id,
+            contacts=prospects,
+            say=say,
+            source="db"
+        )
+        return
+
+    # ── !pipeline ────────────────────────
+    if text.lower().startswith("!pipeline"):
+        parts  = text.lower().split()
+        status = parts[1] if len(parts) > 1 else None
+
+        print(
+            f"📋 [RILEY CMD] !pipeline "
+            f"status={status}"
+        )
+
+        if status:
+            prospects = get_prospects(
+                status=status, limit=30
+            )
+            status_label = status.replace("_", " ")
+            say(format_prospects_for_slack(
+                prospects,
+                f"📋 Prospects — {status_label}"
+            ))
+        else:
+            counts = get_pipeline_summary()
+            say(
+                format_pipeline_summary_for_slack(counts)
+            )
+        return
+
+    # ── !mark replied/closed ─────────────
+    if text.lower().startswith("!mark "):
+        parts = text.split(" ", 2)
+        if len(parts) < 3:
+            say(
+                "⚠️ Usage:\n"
+                "*!mark replied <business name>*\n"
+                "*!mark closed <business name>*"
+            )
+            return
+
+        action       = parts[1].lower().strip()
+        business_str = parts[2].strip()
+
+        if action not in ["replied", "closed"]:
+            say(
+                "⚠️ Valid actions: "
+                "*replied* or *closed*"
+            )
+            return
+
+        print(
+            f"🏷️  [RILEY CMD] !mark {action} "
+            f"'{business_str}'"
+        )
+
+        prospect = get_prospect_by_name(business_str)
+        if not prospect:
+            say(
+                f"⚠️ Could not find prospect "
+                f"matching *{business_str}*.\n"
+                f"Type *!pipeline* to see all prospects."
+            )
+            return
+
+        update_prospect_status(
+            prospect_id=prospect["id"],
+            status=action
+        )
+
+        icon = "💬" if action == "replied" else "🏁"
+        say(
+            f"{icon} *{prospect['business_name']}* "
+            f"marked as *{action}*."
+        )
+        return
+
+    # ── OTHER COMMANDS ────────────────────
+
+    if text.lower() == "!reset":
+        print(f"🔄 [RILEY CMD] !reset")
+        clear_history("riley", user_id)
+        say("🔄 Memory cleared.")
+        return
+
+    if text.lower() == "!status":
+        print(f"📋 [RILEY CMD] !status")
+        logs      = get_recent_logs(limit=15)
+        formatted = format_logs_for_slack(logs)
+        say(formatted)
+        return
+
+    if text.lower() == "!automode on":
+        print(f"⚡ [RILEY CMD] !automode on")
+        set_auto_mode(user_id, True)
+        say(
+            "⚡ *Auto-send ON* — emails go immediately "
+            "without approval.\n"
+            "Type *!automode off* to switch back."
+        )
+        return
+
+    if text.lower() == "!automode off":
+        print(f"✋ [RILEY CMD] !automode off")
+        set_auto_mode(user_id, False)
+        say(
+            "✋ *Approval mode ON* — "
+            "I'll show each draft first."
+        )
+        return
+
+    if text.lower() == "!showprefs":
+        print(f"🧠 [RILEY CMD] !showprefs")
+        from tools.preferences import get_preferences
+        prefs = get_preferences(user_id)
+        if not prefs:
+            say(
+                "🧠 No preferences saved yet.\n"
+                "Tell me things like "
+                "_'keep it under 80 words'_ "
+                "and I'll remember them."
+            )
+        else:
+            prefs_list = "\n".join(
+                [f"  {i+1}. {p}"
+                 for i, p in enumerate(prefs)]
+            )
+            say(
+                f"🧠 *Saved preferences "
+                f"({len(prefs)}):*\n"
+                f"{prefs_list}\n\n"
+                f"_Type *!resetprefs* to clear all._"
+            )
+        return
+
+    if text.lower() == "!resetprefs":
+        print(f"🗑️  [RILEY CMD] !resetprefs")
+        from tools.preferences import clear_preferences
+        clear_preferences(user_id)
+        say("🗑️ All preferences cleared.")
+        return
+
+    if text.lower() == "!resetrun":
+        print(f"🗑️  [RILEY CMD] !resetrun")
+        clear_run_state(user_id)
+        if user_id in approval_state:
+            del approval_state[user_id]
+        say(
+            "🗑️ Outreach run cancelled.\n"
+            "Type *!run* to start a new one."
+        )
+        return
+
+    # ── APPROVAL REPLY ───────────────────
+    if user_id in approval_state and \
+       approval_state[user_id].get("waiting"):
+        print(f"📨 [RILEY ROUTING] → approval reply")
+        handle_approval_reply(user_id, text, say)
+        return
+
+    # ── PASTED TABLE ─────────────────────
+    if (
+        "\n" in text and
+        "@" in text and
+        ("|" in text or "\t" in text)
+    ):
+        print(f"📋 [RILEY ROUTING] Pasted table")
+        result = parse_pasted_table(text, user_id)
+
+        if isinstance(result, tuple):
+            contacts, skipped = result
+        else:
+            contacts = result
+            skipped  = []
+
+        if contacts:
+            if skipped:
+                say(
+                    f"⚠️ Skipped {len(skipped)} "
+                    f"(no email found)"
+                )
+            start_outreach_run(
+                user_id=user_id,
+                contacts=contacts,
+                say=say,
+                source="csv"
+            )
+            return
+
+    # ── GENERAL CHAT ─────────────────────
+    print(f"💬 [RILEY ROUTING] → general chat")
+    say("_Thinking..._")
+    reply = chat_with_riley(user_id, text)
+    say(reply)
+
+
+# ─────────────────────────────────────────
+# RESTORE RILEY'S INTERRUPTED RUNS
+# ─────────────────────────────────────────
+
+def restore_interrupted_runs():
+    """
+    On startup, restores any Riley runs interrupted
+    by a redeploy. Notifies CEO and continues.
+    """
+    interrupted = load_all_run_states()
+
+    if not interrupted:
+        print("✅ [STARTUP] No interrupted runs")
+        return
+
+    print(
+        f"▶️  [STARTUP] Restoring "
+        f"{len(interrupted)} run(s)..."
+    )
+
+    for row in interrupted:
+        user_id   = row["user_id"]
+        remaining = row["remaining_contacts"]
+        stats     = row.get("stats", {
+            "sent": 0, "skipped": 0, "failed": 0
+        })
+
+        print(
+            f"▶️  [STARTUP] {user_id} — "
+            f"{len(remaining)} remaining"
+        )
+
+        approval_state[user_id] = {
+            "pending_result":     None,
+            "remaining_contacts": list(remaining),
+            "waiting":            False,
+            "source":             "db",
+            "stats":              stats
+        }
+
+        def notify_and_resume(uid, rem, sts):
+            try:
+                riley_client.chat_postMessage(
+                    channel=uid,
+                    text=(
+                        f"👋 I'm back after a restart.\n\n"
+                        f"Picking up outreach — "
+                        f"*{len(rem)} prospects "
+                        f"remaining*.\n"
+                        f"Progress so far: "
+                        f"{sts.get('sent', 0)} sent · "
+                        f"{sts.get('skipped', 0)} skipped · "
+                        f"{sts.get('failed', 0)} failed.\n\n"
+                        f"Continuing now..."
+                    )
+                )
+
+                def say(msg):
+                    riley_client.chat_postMessage(
+                        channel=uid, text=msg
+                    )
+
+                process_next_contact(uid, say)
+
+            except Exception as e:
+                print(
+                    f"⚠️  [STARTUP] Notify failed "
+                    f"{uid}: {e}"
+                )
+
+        t = threading.Thread(
+            target=notify_and_resume,
+            args=(user_id, remaining, stats)
+        )
+        t.daemon = True
+        t.start()
+
+
+# ─────────────────────────────────────────
+# STARTUP — BOTH AGENTS
+# ─────────────────────────────────────────
+
+if __name__ == "__main__":
+    print("🚀 Starting DaVinci AI agents...")
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+    print("📚 Loading conversation history...")
+    load_all_conversations()
+
+    print("▶️  Restoring interrupted Riley runs...")
+    restore_interrupted_runs()
+
+    print("🔬 Starting Dexter (Research Agent)...")
+    dexter_handler = SocketModeHandler(
+        dexter_app,
+        os.environ.get("DEXTER_APP_TOKEN")
+    )
+    dexter_thread = threading.Thread(
+        target=dexter_handler.start
+    )
+    dexter_thread.daemon = True
+    dexter_thread.start()
+    print("✅ Dexter is live.")
+
+    print("📧 Starting Riley (Outreach Agent)...")
+    riley_handler = SocketModeHandler(
+        riley_app,
+        os.environ.get("RILEY_APP_TOKEN")
+    )
+
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print("✅ Both agents live.")
+    print("   DM Dexter → research prospects.")
+    print("   DM Riley  → !run to start outreach.")
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+    riley_handler.start()
