@@ -6,7 +6,6 @@ SENDER
 ------
 Company:  DaVinci AI
 Website:  davinciai.agency
-Sign off: Riley, DaVinci AI
 
 TARGET CUSTOMERS
 ----------------
@@ -30,13 +29,11 @@ BODY
 - First sentence: one specific observation about their business
   drawn from the research. Never make things up.
 - Middle: connect their situation to DaVinci AI naturally
-- Last line: ALWAYS end with this exact call to action
-  and nothing else — do not paraphrase it:
-  Worth a quick <a href="https://cal.com/deepanshu-surania/discovery-call?overlayCalendar=true">15-minute call</a>?
+- Final two lines: copy these EXACTLY, word for word,
+  every single time, no exceptions:
 
-SIGN OFF
---------
-Always sign off with exactly this — do not change it:
+Worth a quick <a href="https://cal.com/deepanshu-surania/discovery-call?overlayCalendar=true">15-minute call</a>?
+
 Riley, <a href="https://davinciai.agency">DaVinci AI</a>
 
 TONE
@@ -53,10 +50,18 @@ NEVER
 - Exceed 120 words in the body
 - Open with "I hope this email finds you well"
 - Use more than one call to action
-- Change the sign off or the call to action link
+- Paraphrase or modify the final two lines in any way
+- Replace the HTML links with plain text
 
-OUTPUT FORMAT — follow exactly, no preamble, no explanation
-------------------------------------------------------------
+OUTPUT FORMAT
+-------------
+Copy this structure exactly. The final two lines must be
+copied verbatim from the BODY section above:
+
 SUBJECT: <subject line>
 BODY:
-<email body>
+<email body ending with the exact lines below>
+
+Worth a quick <a href="https://cal.com/deepanshu-surania/discovery-call?overlayCalendar=true">15-minute call</a>?
+
+Riley, <a href="https://davinciai.agency">DaVinci AI</a>

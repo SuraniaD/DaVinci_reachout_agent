@@ -1,4 +1,5 @@
 import os
+import re
 import time
 from groq import Groq
 from dotenv import load_dotenv
@@ -7,7 +8,16 @@ from interaction_log import log_action
 
 load_dotenv()
 
-client = Groq(api_key=os.environ.get("GROQ_API_KEY_RILEY"))
+client = Groq(
+    api_key=os.environ.get("GROQ_API_KEY_RILEY")
+)
+
+# ─────────────────────────────────────────
+# RILEY'S CORE IDENTITY — ~80 tokens
+# Chat rules only
+# Email rules live in email_template.txt
+# Each skill loaded only when that task runs
+# ─────────────────────────────────────────
 
 RILEY_SYSTEM_PROMPT = """
 You are Riley, Outreach Manager at DaVinci AI.
@@ -24,8 +34,6 @@ BEHAVIOUR:
 WHEN THE CEO GIVES FEEDBACK ON AN EMAIL DRAFT:
 - Always acknowledge what you will change
 - Confirm you have saved it as a preference for future drafts
-- Example: "Got it — keeping it under 80 words from now on.
-  I've saved that preference so all future drafts follow it."
 
 COMMANDS:
 - !reset          → confirm memory cleared
@@ -35,10 +43,42 @@ COMMANDS:
 - !showprefs      → list all saved preferences
 - !resetprefs     → clear all saved preferences
 - !resetrun       → cancel current outreach run
+- !run            → start outreach from DB prospects
+- !pipeline       → show prospect pipeline
 """
+
+# ─────────────────────────────────────────
+# DAILY TOKEN LIMITS
+# ─────────────────────────────────────────
 
 DAILY_TOKEN_LIMIT   = 500_000
 session_tokens_used = 0
+
+# ─────────────────────────────────────────
+# HARDCODED LINKS
+# Always injected into emails by parse_draft
+# Never left to the model's discretion
+# ─────────────────────────────────────────
+
+BOOKING_LINK = (
+    "https://cal.com/deepanshu-surania/"
+    "discovery-call?overlayCalendar=true"
+)
+WEBSITE_LINK = "https://davinciai.agency"
+
+CTA_LINE = (
+    f'Worth a quick <a href="{BOOKING_LINK}">'
+    f"15-minute call</a>?"
+)
+SIGNOFF_LINE = (
+    f'Riley, <a href="{WEBSITE_LINK}">DaVinci AI</a>'
+)
+
+# ─────────────────────────────────────────
+# FEEDBACK TRIGGERS
+# Used to detect when CEO is giving style
+# feedback on a draft — saved as preference
+# ─────────────────────────────────────────
 
 FEEDBACK_TRIGGERS = [
     "don't", "dont", "stop", "never",
@@ -53,6 +93,7 @@ FEEDBACK_TRIGGERS = [
 
 
 def _looks_like_feedback(text: str) -> bool:
+    """Returns True if message looks like email style feedback."""
     text_lower = text.lower()
     return any(t in text_lower for t in FEEDBACK_TRIGGERS)
 
@@ -64,18 +105,17 @@ def _extract_preference(
     """
     Uses Groq to extract a clean reusable preference
     from the CEO's feedback message.
+    Returns a short rule or None if not reusable feedback.
     """
     prompt = f"""
 The CEO gave this feedback on an outreach email draft:
 "{feedback}"
 
-If this feedback contains a reusable writing rule
-(something Riley should apply to ALL future emails),
-extract it as a short clear rule in 1 sentence.
+If this contains a reusable writing rule for ALL future
+emails, extract it as one clear sentence.
+If not reusable, reply: NOT_A_PREFERENCE
 
-If it is not a reusable rule reply with: NOT_A_PREFERENCE
-
-Reply with ONLY the rule or NOT_A_PREFERENCE.
+Reply ONLY with the rule or NOT_A_PREFERENCE.
 Examples:
   Input: "make it shorter, 3 sentences max"
   Output: Keep email body to 3 sentences maximum.
@@ -103,6 +143,11 @@ Examples:
         return None
 
 
+# ─────────────────────────────────────────
+# GROQ CALL WITH RETRY
+# Returns (content, tokens_used) tuple
+# ─────────────────────────────────────────
+
 def _call_groq_with_retry(
     messages:    list,
     max_tokens:  int,
@@ -110,7 +155,8 @@ def _call_groq_with_retry(
 ) -> tuple[str, int]:
     """
     Calls Groq with one automatic retry on rate limit.
-    Returns (reply_text, tokens_used).
+    Waits 60 seconds before retrying.
+    Returns (reply_text, tokens_used_this_call).
     """
     for attempt in range(2):
         try:
@@ -122,7 +168,9 @@ def _call_groq_with_retry(
             )
             content     = response.choices[0].message.content
             tokens_used = response.usage.total_tokens
-            print(f"🔢 [TOKENS] {tokens_used} tokens this call")
+            print(
+                f"🔢 [TOKENS] {tokens_used} tokens this call"
+            )
             return content, tokens_used
 
         except Exception as e:
@@ -133,10 +181,17 @@ def _call_groq_with_retry(
             raise e
 
 
+# ─────────────────────────────────────────
+# TOKEN FOOTER
+# Appended to Slack chat replies only
+# Never added to email drafts
+# ─────────────────────────────────────────
+
 def _token_footer(tokens_this_call: int) -> str:
     """
-    Builds token usage line for Slack replies only.
-    Never goes into emails.
+    Builds token usage percentage bar for Slack replies.
+    Shows % used and remaining of daily limit.
+    Session total resets on Railway restart.
     """
     global session_tokens_used
     session_tokens_used += tokens_this_call
@@ -158,43 +213,86 @@ def _token_footer(tokens_this_call: int) -> str:
     bar    = "█" * filled + "░" * (10 - filled)
 
     return (
-        f"\n\n"
-        f"─────────────────────\n"
+        f"\n\n─────────────────────\n"
         f"{indicator} `{bar}` "
         f"{pct_used:.1f}% used · "
         f"{pct_remaining:.1f}% remaining today"
     )
 
 
+# ─────────────────────────────────────────
+# SKILL LOADER
+# Reads any .txt skill file from project root
+# Only called when that specific task runs
+# ─────────────────────────────────────────
+
 def _load_skill(filename: str) -> str:
     """
     Loads a skill file from the project root.
-    Only called when that specific task runs.
+    Tries multiple path strategies for Railway compatibility.
+
+    Current skills:
+      email_template.txt     → email drafting rules
+      (future) strategy_template.txt → targeting advice
+      (future) followup_template.txt → follow-up emails
     """
-    skill_path = os.path.join(
-        os.path.dirname(__file__),
-        "..",
-        filename
+    paths = [
+        os.path.join(
+            os.path.dirname(__file__), "..", filename
+        ),
+        os.path.join(os.getcwd(), filename)
+    ]
+
+    for path in paths:
+        if os.path.exists(path):
+            try:
+                with open(path, "r") as f:
+                    content = f.read()
+                print(f"✅ Skill loaded: {filename}")
+                return content
+            except Exception as e:
+                print(
+                    f"⚠️  Could not read {path}: {e}"
+                )
+
+    print(
+        f"❌ {filename} not found — using fallback\n"
+        f"   CWD: {os.getcwd()}\n"
+        f"   Files: {os.listdir(os.getcwd())}"
     )
-    try:
-        with open(skill_path, "r") as f:
-            content = f.read()
-        print(f"✅ Skill loaded: {filename}")
-        return content
-    except FileNotFoundError:
-        print(f"⚠️  {filename} not found — using fallback")
-        return """
+
+    # Fallback includes hardcoded links so
+    # they always appear even without the skill file
+    return f"""
 Draft a cold outreach email for DaVinci AI.
-Sign off: Riley, DaVinci AI. Max 120 words.
-Format: SUBJECT: <subject>\nBODY:\n<body>
+DaVinci AI automates business workflows with AI agents.
+Max 120 words. Be specific and human.
+End with exactly:
+{CTA_LINE}
+
+{SIGNOFF_LINE}
+
+Format:
+SUBJECT: <subject>
+BODY:
+<body>
 """
 
+
+# ─────────────────────────────────────────
+# GENERAL CHAT
+# Uses core identity prompt — 8B model
+# No email rules, no skill files
+# Token footer appended to every reply
+# ─────────────────────────────────────────
 
 def chat_with_riley(user_id: str, user_message: str) -> str:
     """
     General conversation with Riley.
-    Detects feedback and saves preferences automatically.
-    Appends token footer to Slack replies only.
+    Only RILEY_SYSTEM_PROMPT sent as system message.
+    Detects feedback and saves as preference automatically.
+    Token footer appended to every Slack reply.
+    Raw reply (without footer) saved to memory.
     """
     history = get_history("riley", user_id)
     add_message("riley", user_id, "user", user_message)
@@ -236,8 +334,20 @@ def chat_with_riley(user_id: str, user_message: str) -> str:
 
     except Exception as e:
         print(f"❌ Groq chat error: {e}")
-        return f"Sorry, hit an error: {e}."
+        return (
+            f"Sorry, hit an error: {e}. "
+            f"Try again in a moment."
+        )
 
+
+# ─────────────────────────────────────────
+# DRAFT OUTREACH EMAIL
+# Loads email_template.txt — only here
+# No conversation history sent — not needed
+# Research capped at 800 chars
+# Preferences injected at top of prompt
+# Token footer NOT added — draft goes to email
+# ─────────────────────────────────────────
 
 def draft_outreach_email(
     user_id:       str,
@@ -247,22 +357,31 @@ def draft_outreach_email(
 ) -> str:
     """
     Drafts a personalised outreach email.
-    Loads email_template.txt as system prompt.
-    Injects learned preferences at top of prompt.
-    No token footer added — draft goes into email.
+
+    What gets sent to Groq:
+      system → email_template.txt + preferences (~280-350t)
+      user   → contact details + research (capped 800 chars)
+
+    What does NOT get sent:
+      - Conversation history (irrelevant for drafting)
+      - RILEY_SYSTEM_PROMPT (chat rules irrelevant here)
+      - Token footer (never goes in emails)
     """
     email_skill = _load_skill("email_template.txt")
 
-    # Inject preferences so Riley applies them
+    # Inject CEO preferences at top of prompt
+    # so they override default template rules
     from tools.preferences import build_preferences_block
     prefs_block = build_preferences_block(user_id)
 
     if prefs_block:
         email_skill = prefs_block + "\n\n" + email_skill
-        print(f"🧠 [DRAFT] Injecting preferences")
+        print(f"🧠 [DRAFT] Preferences injected")
     else:
         print("🧠 [DRAFT] No preferences saved yet")
 
+    # Cap research at 800 chars — ~200 tokens
+    # First 800 chars have the most useful facts
     task = f"""Contact name:  {contact_name}
 Business name: {business_name}
 
@@ -286,15 +405,18 @@ Research:
             temperature=0.8
         )
 
-        # Update session total for accurate % display
+        # Update session total so % remaining stays accurate
         # but do NOT add footer to the draft itself
         global session_tokens_used
         session_tokens_used += tokens_used
 
-        pct = (session_tokens_used / DAILY_TOKEN_LIMIT) * 100
+        pct = (
+            session_tokens_used / DAILY_TOKEN_LIMIT
+        ) * 100
         print(
             f"✍️  [DRAFT] {contact_name} @ {business_name} "
-            f"— {tokens_used} tokens · {pct:.1f}% used"
+            f"— {tokens_used} tokens · "
+            f"{pct:.1f}% of daily limit used"
         )
 
         # Save raw draft to memory — no footer
@@ -306,11 +428,23 @@ Research:
         raise Exception(f"Could not draft email: {e}")
 
 
+# ─────────────────────────────────────────
+# PARSE DRAFT
+# Splits SUBJECT/BODY into two strings
+# Strips token footer before parsing
+# ENFORCES correct CTA and sign-off links
+# regardless of what the model wrote
+# ─────────────────────────────────────────
+
 def parse_draft(draft: str) -> tuple[str, str]:
     """
-    Splits SUBJECT/BODY into two strings.
-    Strips token footer before parsing so it never
-    leaks into subject line or email body.
+    Splits Riley's raw draft response into
+    subject line and email body.
+
+    Critical: strips whatever CTA/sign-off the model
+    wrote and re-attaches the correct HTML versions.
+    This guarantees hyperlinks are always present
+    even if the model outputs plain text.
     """
     # Strip token footer if present
     divider = "─────────────────────"
@@ -335,9 +469,41 @@ def parse_draft(draft: str) -> tuple[str, str]:
 
     body = "\n".join(body_lines).strip()
 
+    # Fallback if parsing fails
     if not subject:
         subject = "Reaching out"
     if not body:
         body = draft.strip()
+
+    # ── ENFORCE CORRECT LINKS ─────────────
+    # Strip any version of CTA the model wrote
+    # (plain text, wrong link, or paraphrased)
+    body = re.sub(
+        r'\n*Worth a quick.*?(?:call|minutes?)\??\.?\s*$',
+        '',
+        body,
+        flags=re.IGNORECASE | re.DOTALL
+    ).strip()
+
+    # Strip any version of sign-off the model wrote
+    body = re.sub(
+        r'\n*Riley,?\s*(?:DaVinci AI|davinciai\.agency'
+        r'|<a[^>]*>.*?</a>)?\s*$',
+        '',
+        body,
+        flags=re.IGNORECASE | re.DOTALL
+    ).strip()
+
+    # Also strip loose trailing punctuation
+    # left after sign-off removal
+    body = body.rstrip(",. \n")
+
+    # Re-attach correct HTML links
+    # These are the only versions that ever go in emails
+    body = (
+        f"{body}\n\n"
+        f"{CTA_LINE}\n\n"
+        f"{SIGNOFF_LINE}"
+    )
 
     return subject, body
