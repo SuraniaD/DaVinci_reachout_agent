@@ -1,5 +1,6 @@
 from database import supabase
 from interaction_log import log_action
+from datetime import datetime, timezone
 
 
 def add_prospect(prospect: dict) -> dict | None:
@@ -7,12 +8,10 @@ def add_prospect(prospect: dict) -> dict | None:
     Writes one prospect to the prospects table.
     Validates required fields before inserting.
     Checks for duplicates by business_name first.
-    Returns the inserted row or None if failed/skipped.
     """
     try:
         business_name = prospect.get("business_name")
 
-        # ── VALIDATION ───────────────────────
         if not business_name or \
            str(business_name).strip().lower() in [
                "none", "null", "unknown", "", "n/a",
@@ -26,7 +25,6 @@ def add_prospect(prospect: dict) -> dict | None:
 
         business_name = str(business_name).strip()
 
-        # Reject entries where all key fields are null
         has_any_data = any([
             prospect.get("email"),
             prospect.get("website"),
@@ -41,7 +39,6 @@ def add_prospect(prospect: dict) -> dict | None:
             )
             return None
 
-        # ── DUPLICATE CHECK ───────────────────
         existing = supabase.table("prospects") \
             .select("id, business_name, outreach_status") \
             .ilike("business_name", business_name) \
@@ -56,7 +53,6 @@ def add_prospect(prospect: dict) -> dict | None:
             )
             return None
 
-        # ── INSERT ────────────────────────────
         row = {
             "business_name":    business_name,
             "contact_name":     prospect.get("contact_name") or None,
@@ -98,13 +94,45 @@ def add_prospect(prospect: dict) -> dict | None:
         return None
 
 
+def get_prospects_for_outreach(
+    status: str = "researched",
+    limit:  int = 50
+) -> list[dict]:
+    """
+    Fetches prospects ready for Riley to work on.
+    Returns full prospect data including research_summary.
+    Default status is 'researched' — not yet drafted.
+    Pass 'draft_ready' to retry previously skipped ones.
+    """
+    try:
+        result = supabase.table("prospects") \
+            .select("*") \
+            .eq("outreach_status", status) \
+            .order("created_at", desc=False) \
+            .limit(limit) \
+            .execute()
+
+        print(
+            f"✅ [PROSPECT DB] Fetched "
+            f"{len(result.data)} prospects "
+            f"with status='{status}'"
+        )
+        return result.data
+
+    except Exception as e:
+        print(
+            f"❌ [PROSPECT DB] Fetch failed: {e}"
+        )
+        return []
+
+
 def get_prospects(
     status: str = None,
     limit:  int = 20
 ) -> list[dict]:
     """
-    Fetches prospects from DB.
-    Optional status filter: 'researched', 'sent' etc.
+    Fetches prospects from DB with optional status filter.
+    Returns summary fields only — for pipeline display.
     """
     try:
         query = supabase.table("prospects") \
@@ -130,10 +158,7 @@ def get_prospects(
 def get_prospect_by_name(
     business_name: str
 ) -> dict | None:
-    """
-    Fetches one prospect's full details by name.
-    Used when CEO asks Dexter for a deep dive.
-    """
+    """Fetches one prospect's full details by name."""
     try:
         result = supabase.table("prospects") \
             .select("*") \
@@ -146,7 +171,9 @@ def get_prospect_by_name(
         return None
 
     except Exception as e:
-        print(f"❌ [PROSPECT DB] Name lookup failed: {e}")
+        print(
+            f"❌ [PROSPECT DB] Name lookup failed: {e}"
+        )
         return None
 
 
@@ -154,10 +181,7 @@ def update_prospect_status(
     prospect_id: int,
     status:      str
 ):
-    """
-    Updates outreach_status of a prospect.
-    Called by Riley when status changes.
-    """
+    """Updates outreach_status of a prospect."""
     try:
         supabase.table("prospects") \
             .update({"outreach_status": status}) \
@@ -175,15 +199,133 @@ def update_prospect_status(
         )
 
 
+def save_draft(
+    prospect_id: int,
+    subject:     str,
+    body:        str,
+    version:     int = 1,
+    status:      str = "pending"
+) -> dict | None:
+    """
+    Saves an email draft to the email_drafts table.
+    Creates a new row for every draft version.
+    Called by Riley after drafting each email.
+    """
+    try:
+        result = supabase.table("email_drafts") \
+            .insert({
+                "prospect_id": prospect_id,
+                "subject":     subject,
+                "body":        body,
+                "version":     version,
+                "status":      status
+            }) \
+            .execute()
+
+        if result.data:
+            draft_id = result.data[0]["id"]
+            print(
+                f"✅ [PROSPECT DB] Draft saved — "
+                f"ID {draft_id} "
+                f"(prospect {prospect_id} v{version})"
+            )
+            return result.data[0]
+
+    except Exception as e:
+        print(
+            f"❌ [PROSPECT DB] Draft save failed: {e}"
+        )
+        return None
+
+
+def update_draft_status(
+    draft_id:    int,
+    status:      str,
+    feedback:    str = None,
+    sent_at:     str = None
+):
+    """
+    Updates an email draft's status.
+    Called when CEO approves, skips, or gives feedback.
+    status: pending → approved → sent / rejected
+    """
+    try:
+        update_data = {"status": status}
+        if feedback:
+            update_data["ceo_feedback"] = feedback
+        if sent_at:
+            update_data["sent_at"] = sent_at
+
+        supabase.table("email_drafts") \
+            .update(update_data) \
+            .eq("id", draft_id) \
+            .execute()
+
+        print(
+            f"✅ [PROSPECT DB] Draft {draft_id} "
+            f"→ {status}"
+        )
+
+    except Exception as e:
+        print(
+            f"❌ [PROSPECT DB] Draft update failed: {e}"
+        )
+
+
+def get_latest_draft(
+    prospect_id: int
+) -> dict | None:
+    """
+    Gets the most recent draft for a prospect.
+    Used when resuming a draft_ready prospect.
+    """
+    try:
+        result = supabase.table("email_drafts") \
+            .select("*") \
+            .eq("prospect_id", prospect_id) \
+            .order("version", desc=True) \
+            .limit(1) \
+            .execute()
+
+        if result.data:
+            return result.data[0]
+        return None
+
+    except Exception as e:
+        print(
+            f"❌ [PROSPECT DB] Get draft failed: {e}"
+        )
+        return None
+
+
+def get_pipeline_summary() -> dict:
+    """
+    Returns counts per outreach_status for
+    the pipeline overview command.
+    """
+    try:
+        result = supabase.table("prospects") \
+            .select("outreach_status") \
+            .execute()
+
+        counts = {}
+        for row in result.data:
+            s = row["outreach_status"]
+            counts[s] = counts.get(s, 0) + 1
+
+        return counts
+
+    except Exception as e:
+        print(
+            f"❌ [PROSPECT DB] Pipeline count failed: {e}"
+        )
+        return {}
+
+
 def start_research_session(
     user_id:     str,
     instruction: str
 ) -> int | None:
-    """
-    Creates a research_sessions row when Dexter
-    starts a new research task.
-    Returns the session ID.
-    """
     try:
         result = supabase.table("research_sessions") \
             .insert({
@@ -214,7 +356,6 @@ def complete_research_session(
     prospects_found: int,
     status:          str = "complete"
 ):
-    """Updates a research session when Dexter finishes."""
     try:
         supabase.table("research_sessions") \
             .update({
@@ -239,12 +380,10 @@ def format_prospects_for_slack(
     prospects: list[dict],
     title:     str = "📋 Prospect Pipeline"
 ) -> str:
-    """Formats prospects into a clean Slack message."""
     if not prospects:
         return (
             "📋 No prospects found.\n"
-            "Tell me what businesses to research "
-            "and I'll get started."
+            "Ask Dexter to research some businesses first."
         )
 
     status_icons = {
@@ -275,3 +414,46 @@ def format_prospects_for_slack(
         lines.append(line)
 
     return "\n\n".join(lines)
+
+
+def format_pipeline_summary_for_slack(
+    counts: dict
+) -> str:
+    """Formats pipeline counts into a Slack summary."""
+    if not counts:
+        return (
+            "📊 Pipeline is empty.\n"
+            "Ask Dexter to research some businesses."
+        )
+
+    status_icons = {
+        "researched":  "🔬",
+        "draft_ready": "✍️",
+        "approved":    "✅",
+        "sent":        "📧",
+        "replied":     "💬",
+        "closed":      "🏁",
+        "skipped":     "⏭️"
+    }
+
+    total = sum(counts.values())
+    lines = [f"*📊 Pipeline Summary* ({total} total)\n"]
+
+    order = [
+        "researched", "draft_ready", "approved",
+        "sent", "replied", "closed", "skipped"
+    ]
+
+    for status in order:
+        if status in counts:
+            icon  = status_icons.get(status, "•")
+            label = status.replace("_", " ").title()
+            count = counts[status]
+            lines.append(f"{icon} *{label}:* {count}")
+
+    lines.append(
+        f"\n_Type *!pipeline <status>* to see details_\n"
+        f"_e.g. !pipeline researched · !pipeline sent_"
+    )
+
+    return "\n".join(lines)
