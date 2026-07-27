@@ -26,7 +26,7 @@ You are not limited to any industry or geography.
 
 BEHAVIOUR:
 - Short and direct — this is Slack, not a report
-- Before researching, confirm industry and location
+- Before researching vague requests, confirm industry and location
 - Say clearly what you found and what you couldn't find
 - Use specific search terms for best results
 
@@ -47,8 +47,6 @@ session_tokens_chat     = 0
 
 # ─────────────────────────────────────────
 # ELICITATION STATE
-# Tracks mid-conversation clarification flow
-# before research starts
 # ─────────────────────────────────────────
 
 elicitation_state = {}
@@ -56,9 +54,10 @@ elicitation_state = {}
 
 def _needs_elicitation(text: str) -> bool:
     """
-    Returns True if instruction is too vague and
-    needs industry/location clarification first.
-    Skips if both are already present in the text.
+    Returns True only if BOTH industry AND location
+    are missing from the instruction.
+    If either is present, returns False.
+    Preserves specific terms like 'vegan', 'organic' etc.
     """
     text_lower = text.lower()
 
@@ -69,7 +68,8 @@ def _needs_elicitation(text: str) -> bool:
         "london", "berlin", "paris", "amsterdam",
         "new york", "sydney", "singapore", "dubai",
         "city", "country", "region", "europe",
-        "asia", "africa", "america"
+        "asia", "africa", "america", "worldwide",
+        "global", "international"
     ]
 
     industry_words = [
@@ -84,7 +84,16 @@ def _needs_elicitation(text: str) -> bool:
         "health", "wellness", "fashion", "food",
         "beverage", "marketing", "design", "law",
         "accounting", "finance", "real estate",
-        "construction", "education", "media"
+        "construction", "education", "media",
+        "plant-based", "sustainable", "eco",
+        "beauty", "fitness", "apparel", "clothing",
+        "jewellery", "jewelry", "furniture", "home",
+        "pet", "travel", "insurance", "logistics",
+        "recruitment", "hr", "legal", "dental",
+        "medical", "pharmacy", "grocery", "dairy",
+        "coffee", "tea", "juice", "smoothie",
+        "brewery", "winery", "bakeries", "businesses",
+        "companies", "brands", "shops", "agencies"
     ]
 
     has_location = any(
@@ -94,6 +103,7 @@ def _needs_elicitation(text: str) -> bool:
         w in text_lower for w in industry_words
     )
 
+    # Only ask if BOTH are missing
     return not (has_location and has_industry)
 
 
@@ -103,13 +113,25 @@ def _build_search_query(
     original: str = ""
 ) -> str:
     """
-    Builds a clean DuckDuckGo search query from
-    confirmed industry and location.
+    Builds a clean search query from industry + location.
+    If original instruction is already specific enough,
+    uses it directly to preserve specificity like 'vegan'.
     """
+    # If original already has both industry and location
+    # clearly stated, use it directly
+    if original and not _needs_elicitation(original):
+        # Remove quantity words like "100" from start
+        query = re.sub(
+            r'^\d+\s+', '', original.strip()
+        ).strip()
+        print(
+            f"🔎 [DEXTER] Using original query: '{query}'"
+        )
+        return query
+
+    # Rebuild from confirmed industry + location
     query = f"{industry.strip().lower()} {location.strip()}"
-    print(
-        f"🔎 [DEXTER] Built query: '{query}'"
-    )
+    print(f"🔎 [DEXTER] Built query: '{query}'")
     return query
 
 
@@ -117,10 +139,7 @@ def start_elicitation(
     user_id:  str,
     original: str
 ) -> str:
-    """
-    Starts the elicitation flow.
-    Asks for industry first.
-    """
+    """Starts the elicitation flow — asks for industry first."""
     elicitation_state[user_id] = {
         "stage":    "industry",
         "industry": "",
@@ -147,12 +166,8 @@ def handle_elicitation_reply(
     text:    str
 ) -> tuple[str | None, str | None, str | None, str | None]:
     """
-    Handles a reply during the elicitation flow.
-
-    Returns:
-      (question, None, None, None)       → still collecting
-      (None, query, industry, location)  → ready to research
-      (None, None, None, None)           → error
+    Handles a reply during elicitation.
+    Returns: (question, query, industry, location)
     """
     state = elicitation_state.get(user_id)
     if not state:
@@ -165,8 +180,7 @@ def handle_elicitation_reply(
         state["stage"]    = "location"
 
         print(
-            f"❓ [ELICIT] Industry confirmed: "
-            f"'{state['industry']}'"
+            f"❓ [ELICIT] Industry: '{state['industry']}'"
         )
 
         question = (
@@ -174,8 +188,7 @@ def handle_elicitation_reply(
             f"Which *country, city, or region* "
             f"should I focus on?\n\n"
             f"Examples: _London UK, Netherlands, "
-            f"New York USA, Southeast Asia, "
-            f"Berlin Germany..._"
+            f"New York USA, Southeast Asia..._"
         )
         return question, None, None, None
 
@@ -198,7 +211,6 @@ def handle_elicitation_reply(
             original=state["original"]
         )
 
-        # Clear elicitation state
         del elicitation_state[user_id]
 
         return None, query, industry, location
@@ -207,12 +219,10 @@ def handle_elicitation_reply(
 
 
 def is_in_elicitation(user_id: str) -> bool:
-    """Returns True if user is mid-elicitation."""
     return user_id in elicitation_state
 
 
 def cancel_elicitation(user_id: str):
-    """Cancels in-progress elicitation."""
     if user_id in elicitation_state:
         del elicitation_state[user_id]
         print(f"🚫 [ELICIT] Cancelled for {user_id}")
@@ -278,14 +288,11 @@ def _load_skill(filename: str) -> str:
             try:
                 with open(path, "r") as f:
                     content = f.read()
-                print(
-                    f"✅ [DEXTER] Skill: {filename}"
-                )
+                print(f"✅ [DEXTER] Skill: {filename}")
                 return content
             except Exception as e:
                 print(
-                    f"⚠️  [DEXTER] Read error "
-                    f"{path}: {e}"
+                    f"⚠️  [DEXTER] Read error: {e}"
                 )
 
     print(f"❌ [DEXTER] {filename} not found — fallback")
@@ -341,7 +348,7 @@ def _call_groq(
 
 
 # ─────────────────────────────────────────
-# GENERAL CHAT — 8B only, no skill files
+# GENERAL CHAT — 8B only
 # ─────────────────────────────────────────
 
 def chat_with_dexter(
@@ -421,14 +428,13 @@ def _resolve_email(
         return email
 
     print(
-        f"❌ [EMAIL RESOLVER] Not found: "
-        f"{business_name}"
+        f"❌ [EMAIL RESOLVER] Not found: {business_name}"
     )
     return None
 
 
 # ─────────────────────────────────────────
-# EXTRACT FROM RAW
+# EXTRACT FROM RAW BATCH
 # Sends one batch to 70B with explicit
 # industry + location for strict filtering
 # ─────────────────────────────────────────
@@ -442,7 +448,7 @@ def _extract_from_raw(
     """
     Processes one batch of raw search results.
     Passes industry + location explicitly so the
-    70B model knows exactly what to include/skip.
+    70B model filters strictly by relevance.
     """
     task = f"""
 Search intent: Find {industry} businesses in {location}.
@@ -451,7 +457,7 @@ IMPORTANT:
 - Only extract businesses that are {industry} businesses
 - Only include businesses in or operating in {location}
 - Skip ANYTHING that does not match this exactly
-- Skip large corporations — focus on small/medium businesses
+- Focus on small and medium sized businesses
 
 Web search results:
 {raw[:5000]}
@@ -533,8 +539,7 @@ Web search results:
 # ─────────────────────────────────────────
 # RESEARCH BUSINESSES
 # Main research function
-# industry + location passed explicitly
-# from elicitation flow
+# Preserves query specificity throughout
 # ─────────────────────────────────────────
 
 def research_businesses(
@@ -548,32 +553,39 @@ def research_businesses(
     """
     Researches businesses matching the instruction.
 
-    industry and location should be passed explicitly
-    from the elicitation flow — much more reliable
-    than parsing from conversational instructions.
+    When industry + location are explicitly provided
+    (from elicitation), uses them for clean queries.
 
-    For large targets uses multi-query batch approach.
+    When called directly from !research with a specific
+    query like 'vegan businesses USA', uses the raw
+    instruction to preserve all specificity.
     """
     from tools.web_researcher import (
         search_businesses,
         search_businesses_multi_query
     )
 
-    # Extract target from instruction if mentioned
+    # Extract target number from instruction
     number_match = re.search(r'\b(\d+)\b', instruction)
     if number_match:
         mentioned = int(number_match.group(1))
         if 1 < mentioned <= 200:
             target = mentioned
 
-    # Fall back to parsing if not explicitly provided
+    # ── DETERMINE INDUSTRY + LOCATION ────
+    # If explicitly provided from elicitation — use them
+    # If not — parse from instruction but preserve
+    # the raw instruction for searching
+
     if not industry or not location:
+        # Try to parse industry + location for the
+        # _extract_from_raw filtering context
         parse_prompt = f"""
 Extract the industry/business type and location from:
 "{instruction}"
 
 Reply exactly:
-industry: <type of business>
+industry: <type of business — be specific, e.g. "vegan bakeries" not just "food">
 location: <geographic location>
 
 If unclear: unknown
@@ -609,16 +621,28 @@ If unclear: unknown
     industry = industry or "businesses"
     location = location or "worldwide"
 
+    # ── BUILD SEARCH QUERY ────────────────
+    # Use raw instruction directly when it's specific
+    # This preserves "vegan" in "vegan businesses USA"
+    # rather than rebuilding as "food/restaurant usa"
+    if not _needs_elicitation(instruction):
+        # Remove quantity words from start
+        search_query = re.sub(
+            r'^\d+\s+', '', instruction.strip()
+        ).strip()
+    else:
+        search_query = f"{industry} {location}"
+
     print(
         f"🔬 [DEXTER] Research — "
+        f"query='{search_query}' "
         f"industry='{industry}' "
         f"location='{location}' "
         f"target={target}"
     )
 
     say_fn(
-        f"🔬 Researching: "
-        f"*{industry}* in *{location}*\n"
+        f"🔬 Researching: *{search_query}*\n"
         f"_Target: {target} businesses..._"
     )
 
@@ -628,11 +652,9 @@ If unclear: unknown
     seen_names = set()
 
     if target <= 10:
-        # Single search for small targets
         say_fn("🌐 Searching the web...")
         raw = search_businesses(
-            f"{industry} {location}",
-            max_results=10
+            search_query, max_results=10
         )
 
         if not raw:
@@ -656,15 +678,13 @@ If unclear: unknown
                 all_valid.append(p)
 
     else:
-        # Multi-query batch for large targets
         say_fn(
             f"🌐 Running multiple searches to find "
-            f"{target} *{industry}* businesses "
-            f"in *{location}*..."
+            f"{target} *{search_query}* businesses..."
         )
 
         result_blocks = search_businesses_multi_query(
-            industry=industry,
+            industry=search_query,
             location=location,
             target=target
         )
@@ -730,14 +750,13 @@ If unclear: unknown
         else:
             say_fn(
                 f"✅ Found *{len(all_valid)}* businesses! "
-                f"Now searching for emails..."
+                f"Searching for emails..."
             )
 
     if not all_valid:
         say_fn(
             "⚠️ No matching businesses found.\n"
-            "Try more specific keywords — e.g.\n"
-            "_'vegan bakeries'_ not _'vegan businesses'_"
+            "Try more specific keywords."
         )
         return []
 
