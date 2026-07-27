@@ -24,6 +24,13 @@ def set_auto_mode(user_id: str, value: bool):
     print(f"⚙️  [MODE] {mode} for {user_id}")
 
 
+# ─────────────────────────────────────────
+# DB-FIRST PROCESSOR
+# Used when Riley reads from prospects table
+# Skips immediately if no email in DB
+# No web research — Dexter already did it
+# ─────────────────────────────────────────
+
 def process_prospect_from_db(
     user_id:   str,
     prospect:  dict,
@@ -31,7 +38,7 @@ def process_prospect_from_db(
 ) -> dict | None:
     """
     Processes one prospect from the DB.
-    Skips immediately if no email address found.
+    Skips immediately if no email address — saves tokens.
     Uses research_summary from DB — no web search needed.
     Saves draft to email_drafts table.
     Updates prospect status to draft_ready.
@@ -46,6 +53,7 @@ def process_prospect_from_db(
     industry     = prospect.get("industry", "")
 
     # ── SKIP IF NO EMAIL ─────────────────
+    # Skip before drafting — saves tokens and time
     if not email or str(email).strip().lower() in [
         "", "none", "null", "n/a", "not found"
     ]:
@@ -104,6 +112,7 @@ def process_prospect_from_db(
 
         subject, body = parse_draft(draft)
 
+        # Save draft to email_drafts table
         draft_row = save_draft(
             prospect_id=prospect_id,
             subject=subject,
@@ -112,6 +121,7 @@ def process_prospect_from_db(
             status="pending"
         )
 
+        # Update prospect status → draft_ready
         update_prospect_status(
             prospect_id=prospect_id,
             status="draft_ready"
@@ -151,6 +161,13 @@ def process_prospect_from_db(
         return None
 
 
+# ─────────────────────────────────────────
+# CSV PROCESSOR (legacy)
+# Used when Riley receives a file upload
+# Does web research since no DB research exists
+# Skips immediately if no email
+# ─────────────────────────────────────────
+
 def process_contact(
     user_id: str,
     contact: dict,
@@ -158,20 +175,21 @@ def process_contact(
 ) -> dict | None:
     """
     Legacy handler for CSV-uploaded contacts.
-    Does web research since contact came from CSV.
     Skips immediately if no email.
+    Does web research since contact came from CSV.
     """
     name          = contact.get("name", "")
     business      = contact.get("business_name", "")
     email         = contact.get("email", "")
     extra_context = contact.get("extra_context", "")
 
+    # Skip if no email
     if not email or str(email).strip().lower() in [
         "", "none", "null", "n/a", "not found"
     ]:
         print(
             f"⏭️  [OUTREACH] No email for "
-            f"'{business}' in CSV — skipping"
+            f"'{business}' — skipping"
         )
         say_fn(
             f"⏭️ Skipping *{business}* — "
@@ -231,6 +249,11 @@ def process_contact(
         return None
 
 
+# ─────────────────────────────────────────
+# SEND APPROVED EMAIL
+# Updates draft + prospect status in DB
+# ─────────────────────────────────────────
+
 def send_approved_email(result: dict) -> bool:
     """
     Sends the email for an approved result.
@@ -266,14 +289,21 @@ def send_approved_email(result: dict) -> bool:
     return success
 
 
+# ─────────────────────────────────────────
+# SKIP CONTACT
+# Marks draft as rejected
+# Prospect stays at draft_ready for retry
+# ─────────────────────────────────────────
+
 def skip_contact(
     result:   dict,
     feedback: str = None
 ):
     """
     Records a skipped/rejected draft.
-    Prospect stays at draft_ready for retry.
-    Draft marked as rejected.
+    Prospect stays at draft_ready — retryable
+    with !run draft_ready.
+    Draft marked as rejected with optional feedback.
     """
     contact  = result["contact"]
     draft_id = result.get("draft_id")
@@ -300,6 +330,12 @@ def skip_contact(
         f"@ {contact.get('business_name')}"
     )
 
+
+# ─────────────────────────────────────────
+# SAVE REDRAFT
+# New version row in email_drafts
+# Old draft marked as rejected
+# ─────────────────────────────────────────
 
 def save_redraft(
     result:  dict,
@@ -362,15 +398,25 @@ def save_redraft(
     }
 
 
+# ─────────────────────────────────────────
+# FORMAT DRAFT FOR SLACK
+# Strips HTML tags and token footer
+# Clean preview — actual email has full HTML
+# ─────────────────────────────────────────
+
 def format_draft_for_slack(result: dict) -> str:
     """
-    Formats a draft into a clean Slack approval message.
-    Strips HTML tags and token footer for clean display.
+    Formats draft into clean Slack approval message.
+    Strips HTML tags — Slack doesn't render them.
+    Strips token footer — not needed in draft preview.
+    Actual email sent still has full HTML links.
     """
     contact = result["contact"]
 
+    # Strip HTML tags for clean Slack preview
     clean_body = re.sub(r'<[^>]+>', '', result["body"])
 
+    # Strip token footer if somehow present
     divider = "─────────────────────"
     if divider in clean_body:
         clean_body = clean_body[
@@ -397,6 +443,11 @@ def format_draft_for_slack(result: dict) -> str:
         f"or describe changes to redraft"
     )
 
+
+# ─────────────────────────────────────────
+# GENERATE SUMMARY
+# Posted when outreach run completes
+# ─────────────────────────────────────────
 
 def generate_summary(
     total:   int,

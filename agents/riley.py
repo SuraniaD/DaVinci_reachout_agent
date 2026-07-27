@@ -56,7 +56,7 @@ session_tokens_used = 0
 
 # ─────────────────────────────────────────
 # HARDCODED LINKS
-# Always injected into emails by parse_draft
+# Always injected by parse_draft
 # Never left to the model's discretion
 # ─────────────────────────────────────────
 
@@ -76,8 +76,6 @@ SIGNOFF_LINE = (
 
 # ─────────────────────────────────────────
 # FEEDBACK TRIGGERS
-# Used to detect when CEO is giving style
-# feedback on a draft — saved as preference
 # ─────────────────────────────────────────
 
 FEEDBACK_TRIGGERS = [
@@ -93,7 +91,6 @@ FEEDBACK_TRIGGERS = [
 
 
 def _looks_like_feedback(text: str) -> bool:
-    """Returns True if message looks like email style feedback."""
     text_lower = text.lower()
     return any(t in text_lower for t in FEEDBACK_TRIGGERS)
 
@@ -104,8 +101,7 @@ def _extract_preference(
 ) -> str | None:
     """
     Uses Groq to extract a clean reusable preference
-    from the CEO's feedback message.
-    Returns a short rule or None if not reusable feedback.
+    from CEO feedback. Returns rule string or None.
     """
     prompt = f"""
 The CEO gave this feedback on an outreach email draft:
@@ -113,7 +109,7 @@ The CEO gave this feedback on an outreach email draft:
 
 If this contains a reusable writing rule for ALL future
 emails, extract it as one clear sentence.
-If not reusable, reply: NOT_A_PREFERENCE
+If not reusable reply: NOT_A_PREFERENCE
 
 Reply ONLY with the rule or NOT_A_PREFERENCE.
 Examples:
@@ -174,7 +170,8 @@ def _call_groq_with_retry(
             return content, tokens_used
 
         except Exception as e:
-            if "rate_limit_exceeded" in str(e) and attempt == 0:
+            if "rate_limit_exceeded" in str(e) \
+               and attempt == 0:
                 print("⏳ Groq rate limit — waiting 60s...")
                 time.sleep(60)
                 continue
@@ -183,16 +180,10 @@ def _call_groq_with_retry(
 
 # ─────────────────────────────────────────
 # TOKEN FOOTER
-# Appended to Slack chat replies only
-# Never added to email drafts
+# Slack chat replies only — never in emails
 # ─────────────────────────────────────────
 
 def _token_footer(tokens_this_call: int) -> str:
-    """
-    Builds token usage percentage bar for Slack replies.
-    Shows % used and remaining of daily limit.
-    Session total resets on Railway restart.
-    """
     global session_tokens_used
     session_tokens_used += tokens_this_call
 
@@ -229,12 +220,12 @@ def _token_footer(tokens_this_call: int) -> str:
 def _load_skill(filename: str) -> str:
     """
     Loads a skill file from the project root.
-    Tries multiple path strategies for Railway compatibility.
+    Tries multiple path strategies for Railway.
 
     Current skills:
       email_template.txt     → email drafting rules
-      (future) strategy_template.txt → targeting advice
-      (future) followup_template.txt → follow-up emails
+      (future) strategy_template.txt
+      (future) followup_template.txt
     """
     paths = [
         os.path.join(
@@ -261,8 +252,7 @@ def _load_skill(filename: str) -> str:
         f"   Files: {os.listdir(os.getcwd())}"
     )
 
-    # Fallback includes hardcoded links so
-    # they always appear even without the skill file
+    # Fallback includes hardcoded links
     return f"""
 Draft a cold outreach email for DaVinci AI.
 DaVinci AI automates business workflows with AI agents.
@@ -281,18 +271,17 @@ BODY:
 
 # ─────────────────────────────────────────
 # GENERAL CHAT
-# Uses core identity prompt — 8B model
-# No email rules, no skill files
-# Token footer appended to every reply
+# Core identity prompt only — 8B model
+# No email rules, no skill files loaded
+# Token footer appended to every Slack reply
+# Raw reply saved to memory without footer
 # ─────────────────────────────────────────
 
 def chat_with_riley(user_id: str, user_message: str) -> str:
     """
     General conversation with Riley.
-    Only RILEY_SYSTEM_PROMPT sent as system message.
-    Detects feedback and saves as preference automatically.
-    Token footer appended to every Slack reply.
-    Raw reply (without footer) saved to memory.
+    Detects feedback and saves as preference.
+    Token footer appended to Slack reply only.
     """
     history = get_history("riley", user_id)
     add_message("riley", user_id, "user", user_message)
@@ -325,11 +314,10 @@ def chat_with_riley(user_id: str, user_message: str) -> str:
                     f"🧠 [LEARN] Saved: '{preference}'"
                 )
 
-        # Save raw reply to memory WITHOUT footer
-        # so footer never pollutes future history
+        # Save raw reply WITHOUT footer to memory
         add_message("riley", user_id, "assistant", reply)
 
-        # Return reply WITH footer for Slack display
+        # Return WITH footer for Slack display
         return reply + _token_footer(tokens_used)
 
     except Exception as e:
@@ -343,10 +331,10 @@ def chat_with_riley(user_id: str, user_message: str) -> str:
 # ─────────────────────────────────────────
 # DRAFT OUTREACH EMAIL
 # Loads email_template.txt — only here
-# No conversation history sent — not needed
+# No conversation history sent
 # Research capped at 800 chars
 # Preferences injected at top of prompt
-# Token footer NOT added — draft goes to email
+# Token footer NOT added to draft
 # ─────────────────────────────────────────
 
 def draft_outreach_email(
@@ -357,20 +345,13 @@ def draft_outreach_email(
 ) -> str:
     """
     Drafts a personalised outreach email.
-
-    What gets sent to Groq:
-      system → email_template.txt + preferences (~280-350t)
-      user   → contact details + research (capped 800 chars)
-
-    What does NOT get sent:
-      - Conversation history (irrelevant for drafting)
-      - RILEY_SYSTEM_PROMPT (chat rules irrelevant here)
-      - Token footer (never goes in emails)
+    Uses email_template.txt as system prompt.
+    Injects CEO preferences at top of prompt.
+    Token footer never added — draft goes to email.
     """
     email_skill = _load_skill("email_template.txt")
 
-    # Inject CEO preferences at top of prompt
-    # so they override default template rules
+    # Inject preferences so they override template rules
     from tools.preferences import build_preferences_block
     prefs_block = build_preferences_block(user_id)
 
@@ -380,8 +361,6 @@ def draft_outreach_email(
     else:
         print("🧠 [DRAFT] No preferences saved yet")
 
-    # Cap research at 800 chars — ~200 tokens
-    # First 800 chars have the most useful facts
     task = f"""Contact name:  {contact_name}
 Business name: {business_name}
 
@@ -405,8 +384,7 @@ Research:
             temperature=0.8
         )
 
-        # Update session total so % remaining stays accurate
-        # but do NOT add footer to the draft itself
+        # Update session total — no footer in draft
         global session_tokens_used
         session_tokens_used += tokens_used
 
@@ -433,18 +411,18 @@ Research:
 # Splits SUBJECT/BODY into two strings
 # Strips token footer before parsing
 # ENFORCES correct CTA and sign-off links
-# regardless of what the model wrote
+# Line-by-line filtering catches all variants
 # ─────────────────────────────────────────
 
 def parse_draft(draft: str) -> tuple[str, str]:
     """
-    Splits Riley's raw draft response into
-    subject line and email body.
+    Splits Riley's raw draft into subject and body.
 
-    Critical: strips whatever CTA/sign-off the model
-    wrote and re-attaches the correct HTML versions.
-    This guarantees hyperlinks are always present
-    even if the model outputs plain text.
+    Critical behaviour:
+    - Strips ALL CTA and sign-off variants the model
+      may have written (plain text, HTML, duplicate)
+    - Re-attaches correct HTML links exactly once
+    - Guarantees hyperlinks always present in email
     """
     # Strip token footer if present
     divider = "─────────────────────"
@@ -469,37 +447,62 @@ def parse_draft(draft: str) -> tuple[str, str]:
 
     body = "\n".join(body_lines).strip()
 
-    # Fallback if parsing fails
     if not subject:
         subject = "Reaching out"
     if not body:
         body = draft.strip()
 
-    # ── ENFORCE CORRECT LINKS ─────────────
-    # Strip any version of CTA the model wrote
-    # (plain text, wrong link, or paraphrased)
-    body = re.sub(
-        r'\n*Worth a quick.*?(?:call|minutes?)\??\.?\s*$',
-        '',
-        body,
-        flags=re.IGNORECASE | re.DOTALL
-    ).strip()
+    # ── STRIP CTA AND SIGN-OFF ────────────
+    # Process line by line — remove any line
+    # containing CTA or sign-off in ANY form:
+    # plain text, HTML, paraphrased, duplicate
 
-    # Strip any version of sign-off the model wrote
-    body = re.sub(
-        r'\n*Riley,?\s*(?:DaVinci AI|davinciai\.agency'
-        r'|<a[^>]*>.*?</a>)?\s*$',
-        '',
-        body,
-        flags=re.IGNORECASE | re.DOTALL
-    ).strip()
+    cta_phrases = [
+        "15-minute call",
+        "15 minute call",
+        "quick call",
+        "worth a quick",
+        "schedule a call",
+        "book a call",
+        "hop on a call",
+        "discovery call",
+        "cal.com",
+    ]
 
-    # Also strip loose trailing punctuation
-    # left after sign-off removal
+    signoff_phrases = [
+        "riley, davinci",
+        "riley,davinci",
+        "riley, <a",
+        "davinciai.agency",
+    ]
+
+    cleaned_lines = []
+    for line in body.split("\n"):
+        line_lower = line.lower().strip()
+
+        # Skip any CTA variant
+        if any(p in line_lower for p in cta_phrases):
+            continue
+
+        # Skip any sign-off variant
+        if any(p in line_lower for p in signoff_phrases):
+            continue
+
+        # Skip bare Riley sign-off lines
+        if line_lower in [
+            "riley,", "riley", "riley, ",
+            "riley, davinci ai", "riley, davinci ai."
+        ]:
+            continue
+
+        cleaned_lines.append(line)
+
+    # Rebuild body and strip trailing blank lines
+    body = "\n".join(cleaned_lines).strip()
     body = body.rstrip(",. \n")
 
-    # Re-attach correct HTML links
-    # These are the only versions that ever go in emails
+    # ── RE-ATTACH CORRECT HTML LINKS ─────
+    # Appended exactly once — always correct HTML
     body = (
         f"{body}\n\n"
         f"{CTA_LINE}\n\n"
