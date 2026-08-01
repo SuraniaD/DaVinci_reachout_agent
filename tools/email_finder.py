@@ -146,6 +146,226 @@ def find_email_from_website(
     )
 
     return chosen
+def find_email_aggressive(
+    business_name: str,
+    website:       str = None,
+    location:      str = None
+) -> str | None:
+    """
+    Aggressive multi-strategy email search.
+    Tries 5 different search approaches before giving up.
+    Called by the audit gate before rejecting a prospect.
+
+    Strategy order:
+    1. Website domain — site:domain.com contact email
+    2. Business name + "email" + location
+    3. Founder/owner search — "[business] founder owner email"
+    4. LinkedIn about page (sometimes surfaces emails)
+    5. Generic contact page patterns (hello@, info@, contact@)
+    """
+    import re as _re
+
+    print(
+        f"🔍 [EMAIL AGGRESSIVE] Trying all strategies: "
+        f"{business_name}"
+    )
+
+    email_pattern = r'[\w\.-]+@[\w\.-]+\.[a-zA-Z]{2,}'
+
+    junk_domains = [
+        "example.com", "test.com", "email.com",
+        "domain.com", "yoursite.com", "sentry.io",
+        "wixpress.com", "shopify.com",
+        "squarespace.com", "wordpress.com",
+        "mailchimp.com", "gmail.com",
+        "yahoo.com", "hotmail.com"
+    ]
+
+    def clean_emails(text: str) -> list[str]:
+        found = _re.findall(email_pattern, text)
+        return [
+            e.lower() for e in found
+            if not any(j in e.lower() for j in junk_domains)
+        ]
+
+    queries = []
+
+    # Strategy 1 — website domain search
+    if website:
+        domain = website \
+            .replace("https://", "") \
+            .replace("http://",  "") \
+            .replace("www.",     "") \
+            .split("/")[0]
+        queries.append(f'site:{domain} email contact')
+        queries.append(
+            f'"{business_name}" {domain} email'
+        )
+
+    # Strategy 2 — business name + location
+    loc_str = f" {location}" if location else ""
+    queries.append(
+        f'"{business_name}"{loc_str} contact email'
+    )
+
+    # Strategy 3 — founder/owner
+    queries.append(
+        f'"{business_name}" founder owner '
+        f'email{loc_str}'
+    )
+
+    # Strategy 4 — LinkedIn (sometimes has emails in
+    # page snippets)
+    queries.append(
+        f'site:linkedin.com "{business_name}" email'
+    )
+
+    # Strategy 5 — common email prefixes
+    if website:
+        domain = website \
+            .replace("https://", "") \
+            .replace("http://",  "") \
+            .replace("www.",     "") \
+            .split("/")[0]
+        for prefix in [
+            "hello", "info", "contact",
+            "hi", "team", "support"
+        ]:
+            queries.append(
+                f'{prefix}@{domain}'
+            )
+
+    for q in queries:
+        try:
+            results = DDGS().text(q, max_results=5)
+            for r in results:
+                text = (
+                    r.get("title", "") + " " +
+                    r.get("body",  "")
+                )
+                emails = clean_emails(text)
+
+                if website:
+                    domain = website \
+                        .replace("https://", "") \
+                        .replace("http://",  "") \
+                        .replace("www.",     "") \
+                        .split("/")[0] \
+                        .replace("www.", "")
+                    # Prefer emails at the business domain
+                    domain_emails = [
+                        e for e in emails
+                        if domain in e
+                    ]
+                    if domain_emails:
+                        print(
+                            f"✅ [EMAIL AGGRESSIVE] "
+                            f"Domain match: {domain_emails[0]}"
+                        )
+                        return domain_emails[0]
+
+                if emails:
+                    print(
+                        f"✅ [EMAIL AGGRESSIVE] "
+                        f"Found: {emails[0]} "
+                        f"via '{q[:40]}'"
+                    )
+                    return emails[0]
+
+        except Exception as e:
+            print(
+                f"⚠️  [EMAIL AGGRESSIVE] "
+                f"Query failed: {e}"
+            )
+            continue
+
+    print(
+        f"❌ [EMAIL AGGRESSIVE] "
+        f"All strategies failed: {business_name}"
+    )
+    return None
+
+
+def audit_prospect(prospect: dict) -> dict:
+    """
+    Audit gate — runs before DB insert.
+    Returns audit result with pass/reject/enrich decision.
+
+    Rules:
+    - PASS:   has a valid email + business name
+    - ENRICH: has business name but no email — try harder
+    - REJECT: no business name, or enrichment failed
+
+    Returns:
+    {
+        "decision": "pass" | "enrich" | "reject",
+        "reason":   str,
+        "prospect": dict  (may have email added)
+    }
+    """
+    business_name = prospect.get("business_name", "")
+    email         = prospect.get("email", "")
+    website       = prospect.get("website")
+    location      = prospect.get("location")
+
+    # Hard reject — no business name
+    if not business_name or \
+       str(business_name).strip().lower() in [
+           "none", "null", "unknown", "", "n/a"
+       ]:
+        return {
+            "decision": "reject",
+            "reason":   "no business name",
+            "prospect": prospect
+        }
+
+    # Pass — already has a valid email
+    if email and str(email).strip().lower() not in [
+        "", "none", "null", "n/a", "not found"
+    ]:
+        # Quick sanity check — does it look like a real email
+        import re as _re
+        if _re.match(
+            r'^[\w\.-]+@[\w\.-]+\.[a-zA-Z]{2,}$',
+            email.strip()
+        ):
+            return {
+                "decision": "pass",
+                "reason":   f"email confirmed: {email}",
+                "prospect": prospect
+            }
+
+    # Enrich — has business name but no valid email
+    # Try aggressive search before rejecting
+    print(
+        f"🔍 [AUDIT] No email for '{business_name}' "
+        f"— trying enrichment..."
+    )
+
+    found_email = find_email_aggressive(
+        business_name=business_name,
+        website=website,
+        location=location
+    )
+
+    if found_email:
+        prospect["email"] = found_email
+        return {
+            "decision": "pass",
+            "reason":   (
+                f"enriched — found email: {found_email}"
+            ),
+            "prospect": prospect
+        }
+
+    # Reject — enrichment failed
+    return {
+        "decision": "reject",
+        "reason":   (
+            "no email found after aggressive search"
+        ),
+        "prospect": prospect
+    }
 
 
 def find_email_from_business_name(

@@ -56,8 +56,7 @@ def _needs_elicitation(text: str) -> bool:
     """
     Returns True only if BOTH industry AND location
     are missing from the instruction.
-    If either is present, returns False.
-    Preserves specific terms like 'vegan', 'organic' etc.
+    Preserves specific terms like 'vegan', 'organic'.
     """
     text_lower = text.lower()
 
@@ -103,7 +102,6 @@ def _needs_elicitation(text: str) -> bool:
         w in text_lower for w in industry_words
     )
 
-    # Only ask if BOTH are missing
     return not (has_location and has_industry)
 
 
@@ -113,23 +111,19 @@ def _build_search_query(
     original: str = ""
 ) -> str:
     """
-    Builds a clean search query from industry + location.
-    If original instruction is already specific enough,
-    uses it directly to preserve specificity like 'vegan'.
+    Builds a clean search query.
+    Uses original instruction directly when specific
+    enough — preserves terms like 'vegan'.
     """
-    # If original already has both industry and location
-    # clearly stated, use it directly
     if original and not _needs_elicitation(original):
-        # Remove quantity words like "100" from start
         query = re.sub(
             r'^\d+\s+', '', original.strip()
         ).strip()
         print(
-            f"🔎 [DEXTER] Using original query: '{query}'"
+            f"🔎 [DEXTER] Using original: '{query}'"
         )
         return query
 
-    # Rebuild from confirmed industry + location
     query = f"{industry.strip().lower()} {location.strip()}"
     print(f"🔎 [DEXTER] Built query: '{query}'")
     return query
@@ -139,7 +133,6 @@ def start_elicitation(
     user_id:  str,
     original: str
 ) -> str:
-    """Starts the elicitation flow — asks for industry first."""
     elicitation_state[user_id] = {
         "stage":    "industry",
         "industry": "",
@@ -166,7 +159,6 @@ def handle_elicitation_reply(
     text:    str
 ) -> tuple[str | None, str | None, str | None, str | None]:
     """
-    Handles a reply during elicitation.
     Returns: (question, query, industry, location)
     """
     state = elicitation_state.get(user_id)
@@ -388,52 +380,6 @@ def chat_with_dexter(
 
 
 # ─────────────────────────────────────────
-# EMAIL RESOLVER
-# Uses Riley's email_finder tools
-# ─────────────────────────────────────────
-
-def _resolve_email(
-    business_name: str,
-    website:       str = None,
-    location:      str = None
-) -> str | None:
-    from tools.email_finder import (
-        find_email_from_website,
-        find_email_from_business_name
-    )
-
-    print(
-        f"📧 [EMAIL RESOLVER] Looking for: "
-        f"{business_name}"
-    )
-
-    if website:
-        email = find_email_from_website(
-            business_name, website
-        )
-        if email:
-            print(
-                f"✅ [EMAIL RESOLVER] Via website: "
-                f"{email}"
-            )
-            return email
-
-    email = find_email_from_business_name(
-        business_name, location
-    )
-    if email:
-        print(
-            f"✅ [EMAIL RESOLVER] Via name: {email}"
-        )
-        return email
-
-    print(
-        f"❌ [EMAIL RESOLVER] Not found: {business_name}"
-    )
-    return None
-
-
-# ─────────────────────────────────────────
 # EXTRACT FROM RAW BATCH
 # Sends one batch to 70B with explicit
 # industry + location for strict filtering
@@ -540,6 +486,8 @@ Web search results:
 # RESEARCH BUSINESSES
 # Main research function
 # Preserves query specificity throughout
+# Audit gate runs before returning results
+# Only prospects with emails are returned
 # ─────────────────────────────────────────
 
 def research_businesses(
@@ -553,12 +501,13 @@ def research_businesses(
     """
     Researches businesses matching the instruction.
 
-    When industry + location are explicitly provided
-    (from elicitation), uses them for clean queries.
-
-    When called directly from !research with a specific
-    query like 'vegan businesses USA', uses the raw
-    instruction to preserve all specificity.
+    Flow:
+    1. Web search (zero tokens)
+    2. 70B extraction in batches
+    3. Audit gate — aggressive email enrichment
+       for any prospect missing an email
+    4. Reject any that fail enrichment
+    5. Return only prospects with confirmed emails
     """
     from tools.web_researcher import (
         search_businesses,
@@ -573,13 +522,7 @@ def research_businesses(
             target = mentioned
 
     # ── DETERMINE INDUSTRY + LOCATION ────
-    # If explicitly provided from elicitation — use them
-    # If not — parse from instruction but preserve
-    # the raw instruction for searching
-
     if not industry or not location:
-        # Try to parse industry + location for the
-        # _extract_from_raw filtering context
         parse_prompt = f"""
 Extract the industry/business type and location from:
 "{instruction}"
@@ -622,11 +565,9 @@ If unclear: unknown
     location = location or "worldwide"
 
     # ── BUILD SEARCH QUERY ────────────────
-    # Use raw instruction directly when it's specific
-    # This preserves "vegan" in "vegan businesses USA"
-    # rather than rebuilding as "food/restaurant usa"
+    # Use raw instruction directly when specific
+    # to preserve terms like 'vegan'
     if not _needs_elicitation(instruction):
-        # Remove quantity words from start
         search_query = re.sub(
             r'^\d+\s+', '', instruction.strip()
         ).strip()
@@ -652,6 +593,7 @@ If unclear: unknown
     seen_names = set()
 
     if target <= 10:
+        # Single search for small targets
         say_fn("🌐 Searching the web...")
         raw = search_businesses(
             search_query, max_results=10
@@ -678,6 +620,7 @@ If unclear: unknown
                 all_valid.append(p)
 
     else:
+        # Multi-query batch for large targets
         say_fn(
             f"🌐 Running multiple searches to find "
             f"{target} *{search_query}* businesses..."
@@ -750,7 +693,7 @@ If unclear: unknown
         else:
             say_fn(
                 f"✅ Found *{len(all_valid)}* businesses! "
-                f"Searching for emails..."
+                f"Running audit check..."
             )
 
     if not all_valid:
@@ -760,39 +703,96 @@ If unclear: unknown
         )
         return []
 
-    # Hunt for missing emails
+    # ── AUDIT GATE ────────────────────────
+    # Every prospect passes through the audit gate.
+    # Gate tries aggressive email enrichment if no email.
+    # Rejects any that fail all enrichment strategies.
+    # Only prospects with confirmed emails pass.
+
+    from tools.email_finder import audit_prospect
+
     missing_count = sum(
         1 for p in all_valid if not p.get("email")
     )
 
     if missing_count > 0:
         say_fn(
-            f"📧 Searching for "
-            f"{missing_count} missing email"
-            f"{'s' if missing_count > 1 else ''}..."
+            f"📧 {len(all_valid)} businesses found — "
+            f"auditing {missing_count} without email..."
+        )
+    else:
+        say_fn(
+            f"📧 {len(all_valid)} businesses found — "
+            f"running audit check..."
         )
 
-    for i, p in enumerate(all_valid):
-        if p.get("email"):
-            continue
+    passed   = []
+    enriched = []
+    rejected = []
 
-        email = _resolve_email(
-            business_name=p["business_name"],
-            website=p.get("website"),
-            location=p.get("location")
-        )
+    for p in all_valid:
+        result = audit_prospect(p)
 
-        if email:
-            all_valid[i]["email"] = email
+        if result["decision"] == "pass":
+            # Check if email was added during enrichment
+            if not p.get("email") and \
+               result["prospect"].get("email"):
+                enriched.append(
+                    result["prospect"]["business_name"]
+                )
+            passed.append(result["prospect"])
 
-    with_email    = sum(
-        1 for p in all_valid if p.get("email")
-    )
-    without_email = len(all_valid) - with_email
+        else:
+            rejected.append({
+                "name":   p.get("business_name"),
+                "reason": result["reason"]
+            })
+            print(
+                f"❌ [AUDIT] Rejected: "
+                f"'{p.get('business_name')}' — "
+                f"{result['reason']}"
+            )
 
     print(
-        f"📧 [DEXTER] {with_email} with email, "
-        f"{without_email} without"
+        f"✅ [AUDIT] {len(passed)} passed, "
+        f"{len(enriched)} enriched, "
+        f"{len(rejected)} rejected"
     )
 
-    return all_valid
+    if enriched:
+        say_fn(
+            f"✅ Found emails for "
+            f"*{len(enriched)}* additional "
+            f"business"
+            f"{'es' if len(enriched) > 1 else ''} "
+            f"through deeper search."
+        )
+
+    if rejected:
+        rejected_list = "\n".join(
+            f"  • {r['name']}"
+            for r in rejected[:5]
+        )
+        if len(rejected) > 5:
+            rejected_list += (
+                f"\n  • ...and "
+                f"{len(rejected) - 5} more"
+            )
+        say_fn(
+            f"⚠️ *{len(rejected)}* "
+            f"business"
+            f"{'es' if len(rejected) > 1 else ''} "
+            f"had no findable email and "
+            f"{'were' if len(rejected) > 1 else 'was'} "
+            f"excluded:\n"
+            f"{rejected_list}"
+        )
+
+    if not passed:
+        say_fn(
+            "⚠️ No prospects passed the audit.\n"
+            "Try a more specific search — businesses "
+            "with websites tend to have findable emails."
+        )
+
+    return passed
