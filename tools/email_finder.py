@@ -13,15 +13,18 @@ def extract_emails_from_text(text: str) -> list[str]:
     junk_domains = [
         "example.com", "test.com", "email.com",
         "domain.com", "yoursite.com", "sentry.io",
-        "wixpress.com", "shopify.com", "squarespace.com",
-        "wordpress.com", "mailchimp.com", "gmail.com"
+        "wixpress.com", "shopify.com",
+        "squarespace.com", "wordpress.com",
+        "mailchimp.com", "gmail.com",
+        "yahoo.com", "hotmail.com"
     ]
     clean = [
         e.lower() for e in emails
-        if not any(j in e.lower() for j in junk_domains)
+        if not any(
+            j in e.lower() for j in junk_domains
+        )
     ]
 
-    # Deduplicate preserving order
     seen   = set()
     result = []
     for e in clean:
@@ -43,7 +46,6 @@ def extract_domain_from_url(url: str) -> str:
 
 
 def is_url(text: str) -> bool:
-    """Returns True if text looks like a website URL."""
     text = text.strip().lower()
     return (
         text.startswith("http") or
@@ -58,7 +60,6 @@ def is_url(text: str) -> bool:
 
 
 def is_social_media(text: str) -> bool:
-    """Returns True if text is a social media link."""
     keywords = [
         "instagram", "twitter", "facebook",
         "linkedin", "tiktok", "youtube",
@@ -73,19 +74,13 @@ def find_email_from_website(
     website_url:   str
 ) -> str | None:
     """
-    Searches the web for an email address linked to
-    a specific business website.
-    Used by both Riley (file_reader) and Dexter (research).
-
-    Strategy:
-    1. Search "[business] contact email [domain]"
-    2. Search "site:[domain] contact email"
-    3. Search "[business] hello@ OR contact@ OR info@"
+    Searches the web for an email linked to a website.
+    Used by both Riley (file_reader) and Dexter.
     """
     domain = extract_domain_from_url(website_url)
 
     print(
-        f"📧 [EMAIL FINDER] Searching via website — "
+        f"📧 [EMAIL FINDER] Via website — "
         f"{business_name} ({domain})"
     )
 
@@ -109,7 +104,7 @@ def find_email_from_website(
                 all_emails.extend(emails)
 
             if all_emails:
-                break  # Stop at first successful query
+                break
 
         except Exception as e:
             print(
@@ -120,32 +115,88 @@ def find_email_from_website(
 
     if not all_emails:
         print(
-            f"❌ [EMAIL FINDER] No email found for "
+            f"❌ [EMAIL FINDER] No email for "
             f"{business_name} via website"
         )
         return None
 
-    # Prefer emails at the same domain
-    domain_clean   = domain.replace("www.", "")
-    domain_emails  = [
+    domain_clean  = domain.replace("www.", "")
+    domain_emails = [
         e for e in all_emails
         if domain_clean in e
     ]
 
-    chosen = domain_emails[0] if domain_emails \
-        else all_emails[0]
+    chosen = domain_emails[0] \
+        if domain_emails else all_emails[0]
 
     print(
-        f"✅ [EMAIL FINDER] Found via website: {chosen}"
+        f"✅ [EMAIL FINDER] Via website: {chosen}"
     )
 
     log_action(
         action_type="email_found",
         business_name=business_name,
-        detail=f"Found {chosen} via website search"
+        detail=f"Found {chosen} via website"
     )
 
     return chosen
+
+
+def find_email_from_business_name(
+    business_name: str,
+    location:      str = None
+) -> str | None:
+    """
+    Searches for an email when no website is available.
+    """
+    query = f'"{business_name}" contact email'
+    if location:
+        query += f" {location}"
+
+    print(
+        f"📧 [EMAIL FINDER] Via name — "
+        f"{business_name}"
+        f"{f' ({location})' if location else ''}"
+    )
+
+    try:
+        results    = DDGS().text(query, max_results=6)
+        all_emails = []
+
+        for r in results:
+            text   = (
+                r.get("title", "") + " " +
+                r.get("body",  "")
+            )
+            emails = extract_emails_from_text(text)
+            all_emails.extend(emails)
+
+        if all_emails:
+            chosen = all_emails[0]
+            print(
+                f"✅ [EMAIL FINDER] "
+                f"Via name: {chosen}"
+            )
+            log_action(
+                action_type="email_found",
+                business_name=business_name,
+                detail=f"Found {chosen} by name"
+            )
+            return chosen
+
+    except Exception as e:
+        print(
+            f"⚠️  [EMAIL FINDER] "
+            f"Name search failed: {e}"
+        )
+
+    print(
+        f"❌ [EMAIL FINDER] Not found: "
+        f"{business_name}"
+    )
+    return None
+
+
 def find_email_aggressive(
     business_name: str,
     website:       str = None,
@@ -153,24 +204,20 @@ def find_email_aggressive(
 ) -> str | None:
     """
     Aggressive multi-strategy email search.
-    Tries 5 different search approaches before giving up.
-    Called by the audit gate before rejecting a prospect.
+    Tries 5 different approaches before giving up.
+    Called by audit_prospect before rejecting a lead.
 
     Strategy order:
-    1. Website domain — site:domain.com contact email
-    2. Business name + "email" + location
-    3. Founder/owner search — "[business] founder owner email"
-    4. LinkedIn about page (sometimes surfaces emails)
-    5. Generic contact page patterns (hello@, info@, contact@)
+    1. Website domain — site:domain.com contact
+    2. Business name + email + location
+    3. Founder/owner search
+    4. LinkedIn snippet search
+    5. Common email prefix patterns
     """
-    import re as _re
-
     print(
-        f"🔍 [EMAIL AGGRESSIVE] Trying all strategies: "
+        f"🔍 [EMAIL AGGRESSIVE] All strategies: "
         f"{business_name}"
     )
-
-    email_pattern = r'[\w\.-]+@[\w\.-]+\.[a-zA-Z]{2,}'
 
     junk_domains = [
         "example.com", "test.com", "email.com",
@@ -182,27 +229,33 @@ def find_email_aggressive(
     ]
 
     def clean_emails(text: str) -> list[str]:
-        found = _re.findall(email_pattern, text)
+        pattern = r'[\w\.-]+@[\w\.-]+\.[a-zA-Z]{2,}'
+        found   = re.findall(pattern, text)
         return [
             e.lower() for e in found
-            if not any(j in e.lower() for j in junk_domains)
+            if not any(
+                j in e.lower() for j in junk_domains
+            )
         ]
 
-    queries = []
+    domain   = None
+    queries  = []
 
-    # Strategy 1 — website domain search
     if website:
         domain = website \
             .replace("https://", "") \
             .replace("http://",  "") \
             .replace("www.",     "") \
             .split("/")[0]
+
+    # Strategy 1 — website domain
+    if domain:
         queries.append(f'site:{domain} email contact')
         queries.append(
             f'"{business_name}" {domain} email'
         )
 
-    # Strategy 2 — business name + location
+    # Strategy 2 — name + location
     loc_str = f" {location}" if location else ""
     queries.append(
         f'"{business_name}"{loc_str} contact email'
@@ -214,53 +267,34 @@ def find_email_aggressive(
         f'email{loc_str}'
     )
 
-    # Strategy 4 — LinkedIn (sometimes has emails in
-    # page snippets)
+    # Strategy 4 — LinkedIn snippets
     queries.append(
         f'site:linkedin.com "{business_name}" email'
     )
-
-    # Strategy 5 — common email prefixes
-    if website:
-        domain = website \
-            .replace("https://", "") \
-            .replace("http://",  "") \
-            .replace("www.",     "") \
-            .split("/")[0]
-        for prefix in [
-            "hello", "info", "contact",
-            "hi", "team", "support"
-        ]:
-            queries.append(
-                f'{prefix}@{domain}'
-            )
 
     for q in queries:
         try:
             results = DDGS().text(q, max_results=5)
             for r in results:
-                text = (
+                text   = (
                     r.get("title", "") + " " +
                     r.get("body",  "")
                 )
                 emails = clean_emails(text)
 
-                if website:
-                    domain = website \
-                        .replace("https://", "") \
-                        .replace("http://",  "") \
-                        .replace("www.",     "") \
-                        .split("/")[0] \
-                        .replace("www.", "")
-                    # Prefer emails at the business domain
+                if domain:
+                    domain_clean  = domain.replace(
+                        "www.", ""
+                    )
                     domain_emails = [
                         e for e in emails
-                        if domain in e
+                        if domain_clean in e
                     ]
                     if domain_emails:
                         print(
                             f"✅ [EMAIL AGGRESSIVE] "
-                            f"Domain match: {domain_emails[0]}"
+                            f"Domain match: "
+                            f"{domain_emails[0]}"
                         )
                         return domain_emails[0]
 
@@ -279,6 +313,40 @@ def find_email_aggressive(
             )
             continue
 
+    # Strategy 5 — common prefix guesses
+    # Only if we have a domain to guess against
+    if domain:
+        for prefix in [
+            "hello", "info", "contact",
+            "hi", "team", "support"
+        ]:
+            guessed = f"{prefix}@{domain}"
+            print(
+                f"🔍 [EMAIL AGGRESSIVE] "
+                f"Trying prefix guess: {guessed}"
+            )
+            # Verify the guess exists via search
+            try:
+                results = DDGS().text(
+                    guessed, max_results=3
+                )
+                for r in results:
+                    text   = (
+                        r.get("title", "") + " " +
+                        r.get("body",  "")
+                    )
+                    emails = clean_emails(text)
+                    # Only return if the guessed email
+                    # actually appears in results
+                    if guessed in emails:
+                        print(
+                            f"✅ [EMAIL AGGRESSIVE] "
+                            f"Prefix confirmed: {guessed}"
+                        )
+                        return guessed
+            except Exception:
+                continue
+
     print(
         f"❌ [EMAIL AGGRESSIVE] "
         f"All strategies failed: {business_name}"
@@ -289,7 +357,7 @@ def find_email_aggressive(
 def audit_prospect(prospect: dict) -> dict:
     """
     Audit gate — runs before DB insert.
-    Returns audit result with pass/reject/enrich decision.
+    Decides pass / reject for each prospect.
 
     Rules:
     - PASS:   has a valid email + business name
@@ -298,7 +366,7 @@ def audit_prospect(prospect: dict) -> dict:
 
     Returns:
     {
-        "decision": "pass" | "enrich" | "reject",
+        "decision": "pass" | "reject",
         "reason":   str,
         "prospect": dict  (may have email added)
     }
@@ -323,9 +391,7 @@ def audit_prospect(prospect: dict) -> dict:
     if email and str(email).strip().lower() not in [
         "", "none", "null", "n/a", "not found"
     ]:
-        # Quick sanity check — does it look like a real email
-        import re as _re
-        if _re.match(
+        if re.match(
             r'^[\w\.-]+@[\w\.-]+\.[a-zA-Z]{2,}$',
             email.strip()
         ):
@@ -335,11 +401,10 @@ def audit_prospect(prospect: dict) -> dict:
                 "prospect": prospect
             }
 
-    # Enrich — has business name but no valid email
-    # Try aggressive search before rejecting
+    # No email — try aggressive enrichment
     print(
-        f"🔍 [AUDIT] No email for '{business_name}' "
-        f"— trying enrichment..."
+        f"🔍 [AUDIT] No email for "
+        f"'{business_name}' — enriching..."
     )
 
     found_email = find_email_aggressive(
@@ -353,12 +418,13 @@ def audit_prospect(prospect: dict) -> dict:
         return {
             "decision": "pass",
             "reason":   (
-                f"enriched — found email: {found_email}"
+                f"enriched — "
+                f"found email: {found_email}"
             ),
             "prospect": prospect
         }
 
-    # Reject — enrichment failed
+    # Reject — all strategies failed
     return {
         "decision": "reject",
         "reason":   (
@@ -366,62 +432,3 @@ def audit_prospect(prospect: dict) -> dict:
         ),
         "prospect": prospect
     }
-
-
-def find_email_from_business_name(
-    business_name: str,
-    location:      str = None
-) -> str | None:
-    """
-    Searches for an email when no website is available.
-    Uses business name + optional location.
-    Used by both Riley (file_reader) and Dexter (research).
-    """
-    query = f'"{business_name}" contact email'
-    if location:
-        query += f" {location}"
-
-    print(
-        f"📧 [EMAIL FINDER] Searching by name — "
-        f"{business_name}"
-        f"{f' ({location})' if location else ''}"
-    )
-
-    try:
-        results    = DDGS().text(query, max_results=6)
-        all_emails = []
-
-        for r in results:
-            text   = (
-                r.get("title", "") + " " +
-                r.get("body",  "")
-            )
-            emails = extract_emails_from_text(text)
-            all_emails.extend(emails)
-
-        if all_emails:
-            chosen = all_emails[0]
-            print(
-                f"✅ [EMAIL FINDER] "
-                f"Found by name: {chosen}"
-            )
-            log_action(
-                action_type="email_found",
-                business_name=business_name,
-                detail=(
-                    f"Found {chosen} by name search"
-                )
-            )
-            return chosen
-
-    except Exception as e:
-        print(
-            f"⚠️  [EMAIL FINDER] "
-            f"Name search failed: {e}"
-        )
-
-    print(
-        f"❌ [EMAIL FINDER] No email found for "
-        f"{business_name}"
-    )
-    return None
