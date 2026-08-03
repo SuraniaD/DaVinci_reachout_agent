@@ -569,17 +569,20 @@ def _extract_from_raw(
     Processes one batch of raw search results.
     Passes industry + location for strict filtering.
     """
-    task = f"""
+task = f"""
 Search intent: Find {industry} businesses in {location}.
 
 IMPORTANT:
-- Only extract businesses that are {industry} businesses
-- Only include businesses in or operating in {location}
-- Skip ANYTHING that does not match this exactly
+- Extract EVERY distinct business you can find in the results
+- Only include businesses that match: {industry} in {location}
+- Extract as many as possible — do not limit yourself
+- Include businesses even if information is partial
 - Focus on small and medium sized businesses
+- If a business name appears with a website or email,
+  always include it
 
 Web search results:
-{raw[:5000]}
+{raw[:8000]}
 """
 
     try:
