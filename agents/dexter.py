@@ -50,8 +50,6 @@ session_tokens_chat     = 0
 # ELICITATION STATE
 # Stage flow:
 #   industry → location → [clarify] → ready
-# clarify stage is optional — only triggered
-# when ambiguity is detected in the query
 # ─────────────────────────────────────────
 
 elicitation_state = {}
@@ -75,7 +73,8 @@ def _needs_elicitation(text: str) -> bool:
         "global", "international", "austria",
         "switzerland", "sweden", "norway", "denmark",
         "belgium", "spain", "italy", "portugal",
-        "poland", "czech", "hungary", "romania"
+        "poland", "czech", "hungary", "romania",
+        "japan", "japanese", "tokyo", "osaka"
     ]
 
     industry_words = [
@@ -116,17 +115,9 @@ def _needs_elicitation(text: str) -> bool:
 
 def _detect_ambiguity(text: str) -> str | None:
     """
-    Detects ambiguous phrasing that needs one more
+    Detects ambiguous phrasing that needs one
     clarifying question before research starts.
-
-    Returns a question string if ambiguous,
-    or None if the query is clear enough.
-
-    Catches:
-    - "make and sell" / "make or sell"
-    - "both X and Y" business types
-    - 3+ business types mentioned
-    - Contradictory size qualifiers
+    Returns a question string or None.
     """
     text_lower = text.lower()
 
@@ -147,10 +138,7 @@ def _detect_ambiguity(text: str) -> str | None:
         )
 
     # Pattern 2 — "both X and Y"
-    both_match = re.search(
-        r'\bboth\b.{0,40}\band\b', text_lower
-    )
-    if both_match:
+    if re.search(r'\bboth\b.{0,40}\band\b', text_lower):
         return (
             "You mentioned *both* — should I search for "
             "these as one combined list, or run separate "
@@ -216,7 +204,6 @@ def _build_search_query(
         query = re.sub(
             r'^\d+\s+', '', original.strip()
         ).strip()
-        # Remove ambiguous connectors
         query = re.sub(
             r'\b(both|make and sell|make or sell)\b',
             '', query, flags=re.IGNORECASE
@@ -238,7 +225,6 @@ def start_elicitation(
     user_id:  str,
     original: str
 ) -> str:
-    """Starts elicitation — asks for industry first."""
     elicitation_state[user_id] = {
         "stage":         "industry",
         "industry":      "",
@@ -246,12 +232,10 @@ def start_elicitation(
         "clarification": "",
         "original":      original
     }
-
     print(
         f"❓ [ELICIT] Starting for {user_id}: "
         f"'{original[:50]}'"
     )
-
     return (
         "What *industry or type of business* "
         "should I research?\n\n"
@@ -262,17 +246,12 @@ def start_elicitation(
 
 
 def start_clarification(
-    user_id:   str,
-    original:  str,
-    industry:  str,
-    location:  str,
-    question:  str
+    user_id:  str,
+    original: str,
+    industry: str,
+    location: str,
+    question: str
 ) -> str:
-    """
-    Starts the clarification stage.
-    Called when industry + location are known
-    but query is still ambiguous.
-    """
     elicitation_state[user_id] = {
         "stage":         "clarify",
         "industry":      industry,
@@ -280,12 +259,9 @@ def start_clarification(
         "clarification": "",
         "original":      original
     }
-
     print(
-        f"❓ [CLARIFY] Ambiguity for {user_id} — "
-        f"asking clarifying question"
+        f"❓ [CLARIFY] Ambiguity for {user_id}"
     )
-
     return question
 
 
@@ -294,11 +270,6 @@ def handle_elicitation_reply(
     text:    str
 ) -> tuple[str | None, str | None, str | None, str | None]:
     """
-    Handles a reply during elicitation flow.
-
-    Stage flow:
-      industry → location → [clarify if needed] → ready
-
     Returns: (question, query, industry, location)
     """
     state = elicitation_state.get(user_id)
@@ -307,61 +278,53 @@ def handle_elicitation_reply(
 
     stage = state["stage"]
 
-    # ── INDUSTRY ─────────────────────────
     if stage == "industry":
         state["industry"] = text.strip()
         state["stage"]    = "location"
-
         print(
             f"❓ [ELICIT] Industry: '{state['industry']}'"
         )
-
         question = (
             f"Got it — *{state['industry']}*.\n\n"
             f"Which *country, city, or region* "
             f"should I focus on?\n\n"
             f"Examples: _London UK, Netherlands, "
-            f"New York USA, Southeast Asia..._"
+            f"New York USA, Japan..._"
         )
         return question, None, None, None
 
-    # ── LOCATION ─────────────────────────
     elif stage == "location":
         state["location"] = text.strip()
-
-        industry = state["industry"]
-        location = state["location"]
-        original = state["original"]
+        industry          = state["industry"]
+        location          = state["location"]
+        original          = state["original"]
 
         print(
             f"✅ [ELICIT] Industry='{industry}' "
             f"Location='{location}'"
         )
 
-        # Check for ambiguity before searching
-        combined          = f"{original} {industry} {location}"
+        combined           = (
+            f"{original} {industry} {location}"
+        )
         ambiguity_question = _detect_ambiguity(combined)
 
         if ambiguity_question:
             state["stage"] = "clarify"
             print(
-                f"❓ [ELICIT] Ambiguity detected — "
-                f"asking clarifying question"
+                f"❓ [ELICIT] Ambiguity detected"
             )
             return ambiguity_question, None, None, None
 
-        # Clear — ready to search
         state["stage"] = "ready"
         query = _build_search_query(
             industry=industry,
             location=location,
             original=original
         )
-
         del elicitation_state[user_id]
         return None, query, industry, location
 
-    # ── CLARIFY ──────────────────────────
     elif stage == "clarify":
         state["clarification"] = text.strip()
         state["stage"]         = "ready"
@@ -381,7 +344,6 @@ def handle_elicitation_reply(
             original=original,
             clarification=clarification
         )
-
         del elicitation_state[user_id]
         return None, query, industry, location
 
@@ -516,7 +478,7 @@ def _call_groq(
 
 
 # ─────────────────────────────────────────
-# GENERAL CHAT — 8B only
+# GENERAL CHAT
 # ─────────────────────────────────────────
 
 def chat_with_dexter(
@@ -557,6 +519,7 @@ def chat_with_dexter(
 
 # ─────────────────────────────────────────
 # EXTRACT FROM RAW BATCH
+# Higher text cap + more aggressive extraction
 # ─────────────────────────────────────────
 
 def _extract_from_raw(
@@ -568,18 +531,19 @@ def _extract_from_raw(
     """
     Processes one batch of raw search results.
     Passes industry + location for strict filtering.
+    Increased text cap and more aggressive extraction.
     """
-task = f"""
+    task = f"""
 Search intent: Find {industry} businesses in {location}.
 
 IMPORTANT:
-- Extract EVERY distinct business you can find in the results
-- Only include businesses that match: {industry} in {location}
+- Extract EVERY distinct business you can find
+- Only include businesses matching: {industry} in {location}
 - Extract as many as possible — do not limit yourself
 - Include businesses even if information is partial
-- Focus on small and medium sized businesses
 - If a business name appears with a website or email,
   always include it
+- Focus on small and medium sized businesses
 
 Web search results:
 {raw[:8000]}
@@ -598,7 +562,7 @@ Web search results:
                 }
             ],
             model=RESEARCH_MODEL,
-            max_tokens=2000,
+            max_tokens=3000,
             temperature=0.1
         )
 
@@ -676,10 +640,10 @@ def research_businesses(
     Researches businesses matching the instruction.
 
     Flow:
-    1. Web search (zero tokens)
-    2. 70B extraction in batches
+    1. Web search — many queries, city by city
+    2. 70B extraction per batch
     3. Audit gate — aggressive email enrichment
-    4. Reject any that fail all enrichment strategies
+    4. Reject any that fail all strategies
     5. Return only prospects with confirmed emails
     """
     from tools.web_researcher import (
@@ -691,7 +655,7 @@ def research_businesses(
     number_match = re.search(r'\b(\d+)\b', instruction)
     if number_match:
         mentioned = int(number_match.group(1))
-        if 1 < mentioned <= 200:
+        if 1 < mentioned <= 500:
             target = mentioned
 
     # ── DETERMINE INDUSTRY + LOCATION ────
@@ -742,9 +706,9 @@ If unclear: unknown
         search_query = re.sub(
             r'^\d+\s+', '', instruction.strip()
         ).strip()
-        # Clean ambiguous connectors
         search_query = re.sub(
-            r'\b(both|make and sell|make or sell)\b',
+            r'\b(both|make and sell|make or sell|'
+            r'list of|list|list \d+)\b',
             '', search_query, flags=re.IGNORECASE
         ).strip()
         search_query = re.sub(
@@ -881,11 +845,6 @@ If unclear: unknown
         return []
 
     # ── AUDIT GATE ────────────────────────
-    # Every prospect passes through audit.
-    # Tries aggressive email enrichment first.
-    # Rejects any that fail all strategies.
-    # Only prospects with confirmed emails pass.
-
     from tools.email_finder import audit_prospect
 
     missing_count = sum(
@@ -958,9 +917,7 @@ If unclear: unknown
             f"⚠️ *{len(rejected)}* "
             f"business"
             f"{'es' if len(rejected) > 1 else ''} "
-            f"had no findable email and "
-            f"{'were' if len(rejected) > 1 else 'was'} "
-            f"excluded:\n"
+            f"excluded — no email found:\n"
             f"{rejected_list}"
         )
 
