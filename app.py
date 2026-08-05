@@ -563,7 +563,7 @@ def process_next_contact(user_id: str, say):
                 _persist_state(user_id)
                 say(
                     f"⏭️ Skipping *{biz_name}* — "
-                    f"no valid email in DB."
+                    f"no valid email."
                 )
                 t = threading.Thread(
                     target=process_next_contact,
@@ -844,6 +844,8 @@ def handle_riley_dm(event, say):
 
         print(f"🚀 [RILEY CMD] !run status={status}")
 
+        # Fetches only prospects with emails
+        # at DB level — no-email rows excluded
         prospects = get_prospects_for_outreach(
             status=status, limit=50
         )
@@ -856,82 +858,49 @@ def handle_riley_dm(event, say):
         if not prospects:
             say(
                 f"📋 No *{status.replace('_', ' ')}* "
-                f"prospects found.\n"
-                f"Ask Dexter to research some businesses."
+                f"prospects with emails found.\n\n"
+                f"• Ask Dexter to research businesses\n"
+                f"• Or type *!pipeline {status}* to "
+                f"see what's in the DB"
             )
             return
 
-        # Debug — log first prospect to Railway logs
-        if prospects:
-            first = prospects[0]
-            print(
-                f"🔍 [RILEY] First prospect: "
-                f"name='{first.get('business_name')}' "
-                f"email='{first.get('email')}' "
-                f"status='{first.get('outreach_status')}'"
-            )
-
-        # Count prospects with valid emails
-        with_email         = []
-        without_email_list = []
-
-        for p in prospects:
-            email = p.get("email") or ""
-            email = str(email).strip()
-
-            if email and \
-               email.lower() not in [
-                   "", "none", "null",
-                   "n/a", "not found", "not available"
-               ] and "@" in email:
-                with_email.append(p)
-            else:
-                without_email_list.append(
-                    p.get("business_name", "unknown")
-                )
-
-        without_count = len(without_email_list)
+        # Secondary sanity check — must have @ in email
+        with_email = [
+            p for p in prospects
+            if p.get("email") and
+            "@" in str(p.get("email", ""))
+        ]
+        without_email = len(prospects) - len(with_email)
 
         print(
-            f"📋 [RILEY] {len(with_email)} with email, "
-            f"{without_count} without"
+            f"📋 [RILEY] {len(with_email)} valid emails, "
+            f"{without_email} invalid"
         )
 
-        if without_email_list:
-            print(
-                f"📋 [RILEY] No email: "
-                f"{without_email_list[:5]}"
-            )
-
         if not with_email:
-            # Show Slack what's actually in the DB
-            # so the problem is visible
-            sample_lines = "\n".join(
-                f"  • {p.get('business_name')} — "
-                f"email: `{p.get('email')}`"
-                for p in prospects[:5]
-            )
             say(
                 f"⚠️ Found *{len(prospects)} prospects* "
-                f"but none have valid email addresses.\n\n"
-                f"Sample from DB:\n"
-                f"{sample_lines}\n\n"
-                f"Ask Dexter to find emails first."
+                f"but emails look invalid.\n"
+                f"Ask Dexter to re-research."
             )
             return
 
-        msg = f"✅ Found *{len(prospects)} prospects*."
-        if without_count > 0:
+        msg = (
+            f"✅ Found *{len(with_email)} prospects* "
+            f"with emails."
+        )
+        if without_email > 0:
             msg += (
-                f"\n⚠️ {without_count} have no email "
-                f"and will be skipped automatically."
+                f"\n⚠️ {without_email} will be skipped "
+                f"(invalid email format)."
             )
         msg += "\nStarting drafting now..."
         say(msg)
 
         start_outreach_run(
             user_id=user_id,
-            contacts=prospects,
+            contacts=with_email,
             say=say,
             source="db"
         )

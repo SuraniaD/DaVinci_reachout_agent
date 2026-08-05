@@ -102,14 +102,21 @@ def get_prospects_for_outreach(
 ) -> list[dict]:
     """
     Fetches prospects ready for Riley to work on.
-    Returns full prospect data including email.
-    Logs the email field for each row for debugging.
+    Filters at DB level — only returns rows where
+    email is not null and not empty.
+    Sorts newest first so audit-gated prospects
+    come through before old no-email ones.
     """
     try:
         result = supabase.table("prospects") \
             .select("*") \
             .eq("outreach_status", status) \
-            .order("created_at", desc=False) \
+            .not_.is_("email", "null") \
+            .neq("email", "") \
+            .neq("email", "None") \
+            .neq("email", "n/a") \
+            .neq("email", "not found") \
+            .order("created_at", desc=True) \
             .limit(limit) \
             .execute()
 
@@ -117,20 +124,16 @@ def get_prospects_for_outreach(
         print(
             f"✅ [PROSPECT DB] Fetched "
             f"{len(rows)} prospects "
-            f"with status='{status}'"
+            f"with status='{status}' and email present"
         )
 
-        # Log email presence for each row
         with_email    = sum(
-            1 for r in rows
-            if r.get("email") and
-            str(r.get("email", "")).strip() not in
-            ["", "none", "null", "n/a"]
+            1 for r in rows if r.get("email")
         )
         without_email = len(rows) - with_email
         print(
             f"📧 [PROSPECT DB] {with_email} with email, "
-            f"{without_email} without email"
+            f"{without_email} without"
         )
 
         return rows
@@ -148,7 +151,8 @@ def get_prospects(
 ) -> list[dict]:
     """
     Fetches prospects for pipeline display.
-    Optional status filter.
+    Optional status filter. No email filter here
+    so pipeline shows full picture.
     """
     try:
         query = supabase.table("prospects") \
