@@ -121,13 +121,11 @@ def _learn_from_approval(
 ):
     contact = result["contact"]
     subject = result.get("subject", "")
-
     print(
         f"✅ [LEARN] Approved: "
         f"'{contact['business_name']}' — "
         f"'{subject[:50]}'"
     )
-
     log_action(
         action_type="approved",
         contact_name=contact.get("name"),
@@ -279,9 +277,9 @@ def handle_dexter_dm(event, say):
     Routing order:
     1. Ignore bot messages
     2. DMs only
-    3. Commands (!prospects, !add, !research, !resetrun)
-    4. Mid-elicitation/clarification reply
-    5. Research intent → elicitation/clarify/direct
+    3. Commands
+    4. Mid-elicitation / clarification reply
+    5. Research intent
     6. General chat
     """
     if event.get("bot_id"):
@@ -352,20 +350,12 @@ def handle_dexter_dm(event, say):
         )
 
         if _needs_elicitation(query):
-            # Missing industry or location — ask
             print(f"   [ELICIT] Vague — asking")
             say(start_elicitation(user_id, query))
-
         else:
-            # Has industry + location
-            # Check for ambiguity before searching
             ambiguity_q = _detect_ambiguity(query)
-
             if ambiguity_q:
-                # Ambiguous — ask clarifying question
-                print(
-                    f"   [CLARIFY] Ambiguity detected"
-                )
+                print(f"   [CLARIFY] Ambiguity detected")
                 say(
                     start_clarification(
                         user_id=user_id,
@@ -376,10 +366,7 @@ def handle_dexter_dm(event, say):
                     )
                 )
             else:
-                # Clear and specific — research directly
-                print(
-                    f"   [DIRECT] Clear — researching"
-                )
+                print(f"   [DIRECT] Clear — researching")
                 _run_research(
                     user_id=user_id,
                     instruction=query,
@@ -388,7 +375,6 @@ def handle_dexter_dm(event, say):
         return
 
     # ── MID-ELICITATION / CLARIFICATION ──
-    # Must come BEFORE research intent detection
     if is_in_elicitation(user_id):
         print(
             f"❓ [DEXTER] Elicitation reply: '{text}'"
@@ -398,11 +384,8 @@ def handle_dexter_dm(event, say):
             handle_elicitation_reply(user_id, text)
 
         if question:
-            # Still collecting — ask next question
             say(question)
-
         elif query:
-            # All info collected — start research
             say(
                 f"✅ Got it — searching for "
                 f"*{query}*..."
@@ -414,7 +397,6 @@ def handle_dexter_dm(event, say):
                 industry=industry,
                 location=location
             )
-
         return
 
     # ── RESEARCH INTENT DETECTION ─────────
@@ -428,7 +410,6 @@ def handle_dexter_dm(event, say):
     ]
     if any(s in text.lower() for s in research_signals):
         print(f"🔬 [DEXTER] Research intent")
-
         if _needs_elicitation(text):
             say(start_elicitation(user_id, text))
         else:
@@ -570,17 +551,19 @@ def process_next_contact(user_id: str, say):
         print(f"▸  [RILEY LOOP] {biz_name}")
 
         if source == "db":
-            email = contact.get("email", "")
+            email = contact.get("email") or ""
+            email = str(email).strip()
+
             if not email or \
-               str(email).strip().lower() in [
+               email.lower() in [
                    "", "none", "null",
                    "n/a", "not found"
-               ]:
+               ] or "@" not in email:
                 stats["skipped"] += 1
                 _persist_state(user_id)
                 say(
                     f"⏭️ Skipping *{biz_name}* — "
-                    f"no email in DB."
+                    f"no valid email in DB."
                 )
                 t = threading.Thread(
                     target=process_next_contact,
@@ -849,7 +832,7 @@ def handle_riley_dm(event, say):
         handle_file_upload(event, say, user_id)
         return
 
-    # !run
+    # ── !run ─────────────────────────────
     if text.lower().startswith("!run"):
         parts  = text.lower().split()
         status = parts[1] if len(parts) > 1 \
@@ -865,34 +848,83 @@ def handle_riley_dm(event, say):
             status=status, limit=50
         )
 
+        print(
+            f"📋 [RILEY] Fetched {len(prospects)} "
+            f"prospects with status='{status}'"
+        )
+
         if not prospects:
             say(
-                f"📋 No *{status.replace('_',' ')}* "
+                f"📋 No *{status.replace('_', ' ')}* "
                 f"prospects found.\n"
                 f"Ask Dexter to research some businesses."
             )
             return
 
-        with_email = [
-            p for p in prospects
-            if p.get("email") and
-            str(p.get("email", "")).strip().lower()
-            not in ["", "none", "null", "n/a"]
-        ]
-        without_email = len(prospects) - len(with_email)
+        # Debug — log first prospect to Railway logs
+        if prospects:
+            first = prospects[0]
+            print(
+                f"🔍 [RILEY] First prospect: "
+                f"name='{first.get('business_name')}' "
+                f"email='{first.get('email')}' "
+                f"status='{first.get('outreach_status')}'"
+            )
+
+        # Count prospects with valid emails
+        with_email         = []
+        without_email_list = []
+
+        for p in prospects:
+            email = p.get("email") or ""
+            email = str(email).strip()
+
+            if email and \
+               email.lower() not in [
+                   "", "none", "null",
+                   "n/a", "not found", "not available"
+               ] and "@" in email:
+                with_email.append(p)
+            else:
+                without_email_list.append(
+                    p.get("business_name", "unknown")
+                )
+
+        without_count = len(without_email_list)
+
+        print(
+            f"📋 [RILEY] {len(with_email)} with email, "
+            f"{without_count} without"
+        )
+
+        if without_email_list:
+            print(
+                f"📋 [RILEY] No email: "
+                f"{without_email_list[:5]}"
+            )
 
         if not with_email:
+            # Show Slack what's actually in the DB
+            # so the problem is visible
+            sample_lines = "\n".join(
+                f"  • {p.get('business_name')} — "
+                f"email: `{p.get('email')}`"
+                for p in prospects[:5]
+            )
             say(
-                "⚠️ No prospects have emails yet.\n"
-                "Ask Dexter to find them first."
+                f"⚠️ Found *{len(prospects)} prospects* "
+                f"but none have valid email addresses.\n\n"
+                f"Sample from DB:\n"
+                f"{sample_lines}\n\n"
+                f"Ask Dexter to find emails first."
             )
             return
 
         msg = f"✅ Found *{len(prospects)} prospects*."
-        if without_email > 0:
+        if without_count > 0:
             msg += (
-                f"\n⚠️ {without_email} have no email "
-                f"and will be skipped."
+                f"\n⚠️ {without_count} have no email "
+                f"and will be skipped automatically."
             )
         msg += "\nStarting drafting now..."
         say(msg)
@@ -905,7 +937,7 @@ def handle_riley_dm(event, say):
         )
         return
 
-    # !pipeline
+    # ── !pipeline ────────────────────────
     if text.lower().startswith("!pipeline"):
         parts  = text.lower().split()
         status = parts[1] if len(parts) > 1 else None
@@ -926,7 +958,7 @@ def handle_riley_dm(event, say):
             )
         return
 
-    # !mark
+    # ── !mark ────────────────────────────
     if text.lower().startswith("!mark "):
         parts = text.split(" ", 2)
         if len(parts) < 3:
@@ -963,7 +995,8 @@ def handle_riley_dm(event, say):
         )
         return
 
-    # Other commands
+    # ── OTHER COMMANDS ────────────────────
+
     if text.lower() == "!reset":
         clear_history("riley", user_id)
         say("🔄 Memory cleared.")
@@ -1020,13 +1053,13 @@ def handle_riley_dm(event, say):
         say("🗑️ Run cancelled.")
         return
 
-    # Approval reply
+    # ── APPROVAL REPLY ───────────────────
     if user_id in approval_state and \
        approval_state[user_id].get("waiting"):
         handle_approval_reply(user_id, text, say)
         return
 
-    # Pasted table
+    # ── PASTED TABLE ─────────────────────
     if (
         "\n" in text and
         "@" in text and
@@ -1053,7 +1086,7 @@ def handle_riley_dm(event, say):
             )
             return
 
-    # General chat
+    # ── GENERAL CHAT ─────────────────────
     print(f"💬 [RILEY ROUTING] → chat")
     say("_Thinking..._")
     say(chat_with_riley(user_id, text))
@@ -1100,7 +1133,8 @@ def restore_interrupted_runs():
                         f"remaining*.\n"
                         f"Progress: "
                         f"{sts.get('sent', 0)} sent · "
-                        f"{sts.get('skipped', 0)} skipped\n\n"
+                        f"{sts.get('skipped', 0)} "
+                        f"skipped\n\n"
                         f"Continuing now..."
                     )
                 )

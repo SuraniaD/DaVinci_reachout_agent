@@ -73,7 +73,9 @@ def add_prospect(prospect: dict) -> dict | None:
             inserted = result.data[0]
             print(
                 f"✅ [PROSPECT DB] Added: "
-                f"'{business_name}' (ID: {inserted['id']})"
+                f"'{business_name}' "
+                f"(ID: {inserted['id']}) "
+                f"email: {row.get('email', 'none')}"
             )
             log_action(
                 action_type="prospect_added",
@@ -100,9 +102,8 @@ def get_prospects_for_outreach(
 ) -> list[dict]:
     """
     Fetches prospects ready for Riley to work on.
-    Returns full prospect data including research_summary.
-    Default status is 'researched' — not yet drafted.
-    Pass 'draft_ready' to retry previously skipped ones.
+    Returns full prospect data including email.
+    Logs the email field for each row for debugging.
     """
     try:
         result = supabase.table("prospects") \
@@ -112,12 +113,27 @@ def get_prospects_for_outreach(
             .limit(limit) \
             .execute()
 
+        rows = result.data
         print(
             f"✅ [PROSPECT DB] Fetched "
-            f"{len(result.data)} prospects "
+            f"{len(rows)} prospects "
             f"with status='{status}'"
         )
-        return result.data
+
+        # Log email presence for each row
+        with_email    = sum(
+            1 for r in rows
+            if r.get("email") and
+            str(r.get("email", "")).strip() not in
+            ["", "none", "null", "n/a"]
+        )
+        without_email = len(rows) - with_email
+        print(
+            f"📧 [PROSPECT DB] {with_email} with email, "
+            f"{without_email} without email"
+        )
+
+        return rows
 
     except Exception as e:
         print(
@@ -131,8 +147,8 @@ def get_prospects(
     limit:  int = 20
 ) -> list[dict]:
     """
-    Fetches prospects from DB with optional status filter.
-    Returns summary fields only — for pipeline display.
+    Fetches prospects for pipeline display.
+    Optional status filter.
     """
     try:
         query = supabase.table("prospects") \
@@ -158,7 +174,6 @@ def get_prospects(
 def get_prospect_by_name(
     business_name: str
 ) -> dict | None:
-    """Fetches one prospect's full details by name."""
     try:
         result = supabase.table("prospects") \
             .select("*") \
@@ -181,7 +196,6 @@ def update_prospect_status(
     prospect_id: int,
     status:      str
 ):
-    """Updates outreach_status of a prospect."""
     try:
         supabase.table("prospects") \
             .update({"outreach_status": status}) \
@@ -207,9 +221,8 @@ def save_draft(
     status:      str = "pending"
 ) -> dict | None:
     """
-    Saves an email draft to the email_drafts table.
+    Saves an email draft to email_drafts table.
     Creates a new row for every draft version.
-    Called by Riley after drafting each email.
     """
     try:
         result = supabase.table("email_drafts") \
@@ -246,7 +259,6 @@ def update_draft_status(
 ):
     """
     Updates an email draft's status.
-    Called when CEO approves, skips, or gives feedback.
     status: pending → approved → sent / rejected
     """
     try:
@@ -275,10 +287,7 @@ def update_draft_status(
 def get_latest_draft(
     prospect_id: int
 ) -> dict | None:
-    """
-    Gets the most recent draft for a prospect.
-    Used when resuming a draft_ready prospect.
-    """
+    """Gets the most recent draft for a prospect."""
     try:
         result = supabase.table("email_drafts") \
             .select("*") \
@@ -299,10 +308,7 @@ def get_latest_draft(
 
 
 def get_pipeline_summary() -> dict:
-    """
-    Returns counts per outreach_status for
-    the pipeline overview command.
-    """
+    """Returns counts per outreach_status."""
     try:
         result = supabase.table("prospects") \
             .select("outreach_status") \
@@ -419,7 +425,6 @@ def format_prospects_for_slack(
 def format_pipeline_summary_for_slack(
     counts: dict
 ) -> str:
-    """Formats pipeline counts into a Slack summary."""
     if not counts:
         return (
             "📊 Pipeline is empty.\n"
