@@ -7,7 +7,11 @@ from tools.prospect_db import (
     update_prospect_status,
     get_latest_draft
 )
-from agents.riley import draft_outreach_email, parse_draft
+from agents.riley import (
+    draft_outreach_email,
+    draft_with_feedback,
+    parse_draft
+)
 from interaction_log import log_action
 from datetime import datetime, timezone
 
@@ -26,9 +30,9 @@ def set_auto_mode(user_id: str, value: bool):
 
 # ─────────────────────────────────────────
 # DB-FIRST PROCESSOR
-# Used when Riley reads from prospects table
-# Skips immediately if no email in DB
-# No web research — Dexter already did it
+# Skips if no email or no research summary
+# Uses research_summary from DB — no web search
+# Saves draft to email_drafts table
 # ─────────────────────────────────────────
 
 def process_prospect_from_db(
@@ -38,9 +42,13 @@ def process_prospect_from_db(
 ) -> dict | None:
     """
     Processes one prospect from the DB.
-    Skips immediately if no email address — saves tokens.
-    Uses research_summary from DB — no web search needed.
-    Saves draft to email_drafts table.
+
+    Guards:
+    1. Skip immediately if no email
+    2. Skip if research_summary is missing or too short
+       — without it the model produces a blank draft
+
+    Saves draft to email_drafts.
     Updates prospect status to draft_ready.
     """
     name         = prospect.get("contact_name") or \
@@ -52,19 +60,39 @@ def process_prospect_from_db(
     location     = prospect.get("location", "")
     industry     = prospect.get("industry", "")
 
-    # ── SKIP IF NO EMAIL ─────────────────
-    # Skip before drafting — saves tokens and time
+    # ── GUARD 1: no email ────────────────
     if not email or str(email).strip().lower() in [
         "", "none", "null", "n/a", "not found"
     ]:
         print(
             f"⏭️  [OUTREACH] No email for "
-            f"'{business}' — skipping immediately"
+            f"'{business}' — skipping"
         )
         say_fn(
             f"⏭️ Skipping *{business}* — "
             f"no email address in DB.\n"
             f"_Ask Dexter to find the email first._"
+        )
+        if prospect_id:
+            update_prospect_status(
+                prospect_id=prospect_id,
+                status="skipped"
+            )
+        return None
+
+    # ── GUARD 2: no research summary ─────
+    # Without a research summary the model has nothing
+    # specific to write about and produces a blank draft.
+    if not research_sum or \
+       len(research_sum.strip()) < 50:
+        print(
+            f"⏭️  [OUTREACH] No research summary for "
+            f"'{business}' — skipping"
+        )
+        say_fn(
+            f"⏭️ Skipping *{business}* — "
+            f"no research summary in DB.\n"
+            f"_Ask Dexter to re-research this business._"
         )
         if prospect_id:
             update_prospect_status(
@@ -82,25 +110,13 @@ def process_prospect_from_db(
 
     full_research = ""
     if extra_context:
-        full_research += (
-            f"Context from prospect list:\n"
-            f"{extra_context}\n"
-        )
+        full_research += f"Context:\n{extra_context}\n"
     if research_sum:
-        full_research += (
-            f"Research summary:\n{research_sum}"
-        )
-
-    if not full_research:
-        full_research = (
-            f"Business: {business}. "
-            f"Write a warm, general outreach email."
-        )
+        full_research += f"Research summary:\n{research_sum}"
 
     try:
         say_fn(
-            f"✍️ Drafting email for "
-            f"*{name}* at *{business}*..."
+            f"✍️ Drafting for *{name}* at *{business}*..."
         )
 
         draft = draft_outreach_email(
@@ -164,8 +180,7 @@ def process_prospect_from_db(
 # ─────────────────────────────────────────
 # CSV PROCESSOR (legacy)
 # Used when Riley receives a file upload
-# Does web research since no DB research exists
-# Skips immediately if no email
+# Does web research — no DB research exists
 # ─────────────────────────────────────────
 
 def process_contact(
@@ -183,7 +198,6 @@ def process_contact(
     email         = contact.get("email", "")
     extra_context = contact.get("extra_context", "")
 
-    # Skip if no email
     if not email or str(email).strip().lower() in [
         "", "none", "null", "n/a", "not found"
     ]:
@@ -192,8 +206,7 @@ def process_contact(
             f"'{business}' — skipping"
         )
         say_fn(
-            f"⏭️ Skipping *{business}* — "
-            f"no email address."
+            f"⏭️ Skipping *{business}* — no email."
         )
         return None
 
@@ -202,15 +215,12 @@ def process_contact(
         research = research_business(business)
 
         say_fn(
-            f"✍️ Drafting email for "
-            f"*{name}* at *{business}*..."
+            f"✍️ Drafting for *{name}* at *{business}*..."
         )
 
         full_research = ""
         if extra_context:
-            full_research += (
-                f"Context:\n{extra_context}\n\n"
-            )
+            full_research += f"Context:\n{extra_context}\n\n"
         full_research += f"Web research:\n{research}"
 
         draft = draft_outreach_email(
@@ -303,7 +313,6 @@ def skip_contact(
     Records a skipped/rejected draft.
     Prospect stays at draft_ready — retryable
     with !run draft_ready.
-    Draft marked as rejected with optional feedback.
     """
     contact  = result["contact"]
     draft_id = result.get("draft_id")
@@ -400,23 +409,22 @@ def save_redraft(
 
 # ─────────────────────────────────────────
 # FORMAT DRAFT FOR SLACK
-# Strips HTML tags and token footer
-# Clean preview — actual email has full HTML
+# Strips HTML for clean Slack preview
+# Actual email still has full HTML links
 # ─────────────────────────────────────────
 
 def format_draft_for_slack(result: dict) -> str:
     """
     Formats draft into clean Slack approval message.
     Strips HTML tags — Slack doesn't render them.
-    Strips token footer — not needed in draft preview.
-    Actual email sent still has full HTML links.
+    Actual email sent has full HTML hyperlinks.
     """
     contact = result["contact"]
 
-    # Strip HTML tags for clean Slack preview
+    # Strip HTML for Slack preview
     clean_body = re.sub(r'<[^>]+>', '', result["body"])
 
-    # Strip token footer if somehow present
+    # Strip token footer if present
     divider = "─────────────────────"
     if divider in clean_body:
         clean_body = clean_body[
@@ -464,4 +472,4 @@ def generate_summary(
         f"• Failed:          {failed}\n\n"
         f"_Type *!pipeline* to see the full "
         f"prospect pipeline._"
-    )
+    )   
