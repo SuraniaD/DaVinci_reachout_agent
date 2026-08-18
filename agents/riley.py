@@ -112,7 +112,7 @@ Examples:
 """
     try:
         response = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
+            model="openai/gpt-oss-20b",
             messages=[{"role": "user", "content": prompt}],
             max_tokens=80,
             temperature=0.1
@@ -135,7 +135,7 @@ def _call_groq_with_retry(
     for attempt in range(2):
         try:
             response = client.chat.completions.create(
-                model="llama-3.1-8b-instant",
+                model="openai/gpt-oss-20b",
                 messages=messages,
                 max_tokens=max_tokens,
                 temperature=temperature

@@ -12,8 +12,8 @@ client = Groq(
     api_key=os.environ.get("GROQ_API_KEY_DEXTER")
 )
 
-RESEARCH_MODEL = "llama-3.3-70b-versatile"
-CHAT_MODEL     = "llama-3.1-8b-instant"
+RESEARCH_MODEL = "openai/gpt-oss-120b"
+CHAT_MODEL     = "openai/gpt-oss-20b"
 
 DEXTER_SYSTEM_PROMPT = """
 You are Dexter, Research Manager at DaVinci AI.
