@@ -3,26 +3,71 @@ from ddgs import DDGS
 from interaction_log import log_action
 
 
+JUNK_DOMAINS = [
+    # Generic / placeholder
+    "example.com", "test.com", "email.com",
+    "domain.com", "yoursite.com", "yourcompany.com",
+    # Website builders / platforms
+    "wixpress.com", "wix.com",
+    "shopify.com", "myshopify.com",
+    "squarespace.com", "wordpress.com",
+    "weebly.com", "webflow.io",
+    "godaddy.com", "namecheap.com",
+    # DNS / registrar / infrastructure
+    "cloudflare.com", "cloudflaressl.com",
+    "registrar-admin.com", "domaincontrol.com",
+    "networksolutions.com", "register.com",
+    "tucows.com", "enom.com", "resellerclub.com",
+    # Email marketing / CRM
+    "mailchimp.com", "mailgun.com",
+    "sendgrid.com", "klaviyo.com",
+    "constantcontact.com", "hubspot.com",
+    # Error tracking / monitoring
+    "sentry.io", "bugsnag.com", "rollbar.com",
+    # Social media
+    "instagram.com", "facebook.com",
+    "twitter.com", "linkedin.com",
+    "tiktok.com", "youtube.com",
+    "pinterest.com", "snapchat.com",
+    # Free personal email (only reject as business email)
+    "gmail.com", "yahoo.com", "hotmail.com",
+    "outlook.com", "icloud.com", "protonmail.com",
+    # Delivery / food platforms
+    "wolt.com", "deliveroo.com", "ubereats.com",
+    "doordash.com", "grubhub.com", "seamless.com",
+    # Aggregators / directories
+    "tripadvisor.com", "yelp.com", "zomato.com",
+    "opentable.com", "thefork.com",
+    "booking.com", "expedia.com",
+    # Press / publishing
+    "sfchronicle.com", "nytimes.com",
+    "theguardian.com", "buzzfeed.com",
+    # E-commerce platforms
+    "amazon.com", "etsy.com", "ebay.com",
+    # HR / recruiting
+    "greenhouse.io", "lever.co", "workday.com",
+    # Company subdomain patterns that are never direct
+    "nyandcompany.com", "pladisglobal.com",
+]
+
+
+def _is_junk_email(email: str) -> bool:
+    """Returns True if email is from a junk domain."""
+    email_lower = email.lower().strip()
+    return any(j in email_lower for j in JUNK_DOMAINS)
+
+
 def extract_emails_from_text(text: str) -> list[str]:
     """
-    Pulls any email addresses out of a block of text.
+    Pulls email addresses out of a block of text.
+    Filters out junk domains immediately.
     """
     pattern = r'[\w\.-]+@[\w\.-]+\.[a-zA-Z]{2,}'
     emails  = re.findall(pattern, text)
 
-    junk_domains = [
-        "example.com", "test.com", "email.com",
-        "domain.com", "yoursite.com", "sentry.io",
-        "wixpress.com", "shopify.com",
-        "squarespace.com", "wordpress.com",
-        "mailchimp.com", "gmail.com",
-        "yahoo.com", "hotmail.com"
-    ]
-    clean = [
+    clean  = [
         e.lower() for e in emails
-        if not any(
-            j in e.lower() for j in junk_domains
-        )
+        if not _is_junk_email(e)
     ]
 
     seen   = set()
@@ -75,7 +120,6 @@ def find_email_from_website(
 ) -> str | None:
     """
     Searches the web for an email linked to a website.
-    Used by both Riley (file_reader) and Dexter.
     """
     domain = extract_domain_from_url(website_url)
 
@@ -212,34 +256,23 @@ def find_email_aggressive(
     2. Business name + email + location
     3. Founder/owner search
     4. LinkedIn snippet search
-    5. Common email prefix patterns
+    5. Common email prefix guesses (confirmed via search)
     """
     print(
         f"🔍 [EMAIL AGGRESSIVE] All strategies: "
         f"{business_name}"
     )
 
-    junk_domains = [
-        "example.com", "test.com", "email.com",
-        "domain.com", "yoursite.com", "sentry.io",
-        "wixpress.com", "shopify.com",
-        "squarespace.com", "wordpress.com",
-        "mailchimp.com", "gmail.com",
-        "yahoo.com", "hotmail.com"
-    ]
-
     def clean_emails(text: str) -> list[str]:
         pattern = r'[\w\.-]+@[\w\.-]+\.[a-zA-Z]{2,}'
         found   = re.findall(pattern, text)
         return [
             e.lower() for e in found
-            if not any(
-                j in e.lower() for j in junk_domains
-            )
+            if not _is_junk_email(e)
         ]
 
-    domain   = None
-    queries  = []
+    domain  = None
+    queries = []
 
     if website:
         domain = website \
@@ -247,6 +280,15 @@ def find_email_aggressive(
             .replace("http://",  "") \
             .replace("www.",     "") \
             .split("/")[0]
+
+        # Reject if website itself is a junk domain
+        if _is_junk_email(f"test@{domain}"):
+            print(
+                f"⚠️  [EMAIL AGGRESSIVE] "
+                f"Website domain is junk: {domain}"
+            )
+            domain  = None
+            website = None
 
     # Strategy 1 — website domain
     if domain:
@@ -314,7 +356,7 @@ def find_email_aggressive(
             continue
 
     # Strategy 5 — common prefix guesses
-    # Only if we have a domain to guess against
+    # Only if we have a non-junk domain
     if domain:
         for prefix in [
             "hello", "info", "contact",
@@ -323,9 +365,8 @@ def find_email_aggressive(
             guessed = f"{prefix}@{domain}"
             print(
                 f"🔍 [EMAIL AGGRESSIVE] "
-                f"Trying prefix guess: {guessed}"
+                f"Trying prefix: {guessed}"
             )
-            # Verify the guess exists via search
             try:
                 results = DDGS().text(
                     guessed, max_results=3
@@ -336,8 +377,6 @@ def find_email_aggressive(
                         r.get("body",  "")
                     )
                     emails = clean_emails(text)
-                    # Only return if the guessed email
-                    # actually appears in results
                     if guessed in emails:
                         print(
                             f"✅ [EMAIL AGGRESSIVE] "
@@ -360,15 +399,18 @@ def audit_prospect(prospect: dict) -> dict:
     Decides pass / reject for each prospect.
 
     Rules:
-    - PASS:   has a valid email + business name
-    - ENRICH: has business name but no email — try harder
-    - REJECT: no business name, or enrichment failed
+    - REJECT:  no business name
+    - REJECT:  email is from a junk domain
+    - PASS:    has a valid non-junk email
+    - ENRICH:  has business name but no email
+               → try aggressive search
+    - REJECT:  enrichment failed
 
     Returns:
     {
         "decision": "pass" | "reject",
         "reason":   str,
-        "prospect": dict  (may have email added)
+        "prospect": dict
     }
     """
     business_name = prospect.get("business_name", "")
@@ -387,23 +429,35 @@ def audit_prospect(prospect: dict) -> dict:
             "prospect": prospect
         }
 
-    # Pass — already has a valid email
+    # Reject or clear junk email
     if email and str(email).strip().lower() not in [
         "", "none", "null", "n/a", "not found"
     ]:
-        if re.match(
+        if _is_junk_email(email):
+            print(
+                f"⚠️  [AUDIT] Junk email for "
+                f"'{business_name}': {email} — "
+                f"clearing and trying enrichment"
+            )
+            # Clear the junk email and try to find
+            # a real one via aggressive search
+            prospect["email"] = None
+            email = None
+
+        elif re.match(
             r'^[\w\.-]+@[\w\.-]+\.[a-zA-Z]{2,}$',
             email.strip()
         ):
+            # Valid non-junk email — pass
             return {
                 "decision": "pass",
                 "reason":   f"email confirmed: {email}",
                 "prospect": prospect
             }
 
-    # No email — try aggressive enrichment
+    # No email or junk cleared — try enrichment
     print(
-        f"🔍 [AUDIT] No email for "
+        f"🔍 [AUDIT] No valid email for "
         f"'{business_name}' — enriching..."
     )
 
@@ -424,7 +478,7 @@ def audit_prospect(prospect: dict) -> dict:
             "prospect": prospect
         }
 
-    # Reject — all strategies failed
+    # All strategies failed — reject
     return {
         "decision": "reject",
         "reason":   (

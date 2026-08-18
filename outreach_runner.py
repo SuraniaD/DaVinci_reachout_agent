@@ -30,23 +30,20 @@ def set_auto_mode(user_id: str, value: bool):
 
 # ─────────────────────────────────────────
 # DB-FIRST PROCESSOR
-# Skips if no email or no research summary
-# Uses research_summary from DB — no web search
-# Saves draft to email_drafts table
 # ─────────────────────────────────────────
 
 def process_prospect_from_db(
-    user_id:   str,
-    prospect:  dict,
+    user_id:  str,
+    prospect: dict,
     say_fn
 ) -> dict | None:
     """
     Processes one prospect from the DB.
 
     Guards:
-    1. Skip immediately if no email
-    2. Skip if research_summary is missing or too short
-       — without it the model produces a blank draft
+    1. Skip if no email
+    2. Skip if research_summary missing or < 50 chars
+    3. Skip if draft body is empty after parsing
 
     Saves draft to email_drafts.
     Updates prospect status to draft_ready.
@@ -70,7 +67,7 @@ def process_prospect_from_db(
         )
         say_fn(
             f"⏭️ Skipping *{business}* — "
-            f"no email address in DB.\n"
+            f"no email address.\n"
             f"_Ask Dexter to find the email first._"
         )
         if prospect_id:
@@ -81,8 +78,6 @@ def process_prospect_from_db(
         return None
 
     # ── GUARD 2: no research summary ─────
-    # Without a research summary the model has nothing
-    # specific to write about and produces a blank draft.
     if not research_sum or \
        len(research_sum.strip()) < 50:
         print(
@@ -111,12 +106,12 @@ def process_prospect_from_db(
     full_research = ""
     if extra_context:
         full_research += f"Context:\n{extra_context}\n"
-    if research_sum:
-        full_research += f"Research summary:\n{research_sum}"
+    full_research += f"Research summary:\n{research_sum}"
 
     try:
         say_fn(
-            f"✍️ Drafting for *{name}* at *{business}*..."
+            f"✍️ Drafting for *{name}* "
+            f"at *{business}*..."
         )
 
         draft = draft_outreach_email(
@@ -126,7 +121,52 @@ def process_prospect_from_db(
             research=full_research
         )
 
+        # ── DEBUG: log raw draft ──────────
+        print(
+            f"📝 [OUTREACH] Raw draft for "
+            f"'{business}':\n"
+            f"{'─' * 40}\n"
+            f"{draft}\n"
+            f"{'─' * 40}"
+        )
+
         subject, body = parse_draft(draft)
+
+        # ── DEBUG: log parsed result ──────
+        print(
+            f"📝 [OUTREACH] Parsed — "
+            f"subject='{subject}' "
+            f"body_len={len(body.strip())}"
+        )
+
+        # ── GUARD 3: empty body ───────────
+        # Strip HTML and CTA to check if there's
+        # actual body content from the model
+        body_check = re.sub(r'<[^>]+>', '', body)
+        body_check = body_check.replace(
+            "Worth a quick 15-minute call?", ""
+        ).replace(
+            "Riley, DaVinci AI", ""
+        ).strip()
+
+        if len(body_check) < 30:
+            print(
+                f"⏭️  [OUTREACH] Empty body for "
+                f"'{business}' — skipping\n"
+                f"Raw draft was:\n{draft}"
+            )
+            say_fn(
+                f"⏭️ Skipping *{business}* — "
+                f"model returned an empty draft.\n"
+                f"_Research summary may be too thin. "
+                f"Ask Dexter to re-research._"
+            )
+            if prospect_id:
+                update_prospect_status(
+                    prospect_id=prospect_id,
+                    status="skipped"
+                )
+            return None
 
         # Save draft to email_drafts table
         draft_row = save_draft(
@@ -137,7 +177,6 @@ def process_prospect_from_db(
             status="pending"
         )
 
-        # Update prospect status → draft_ready
         update_prospect_status(
             prospect_id=prospect_id,
             status="draft_ready"
@@ -179,8 +218,6 @@ def process_prospect_from_db(
 
 # ─────────────────────────────────────────
 # CSV PROCESSOR (legacy)
-# Used when Riley receives a file upload
-# Does web research — no DB research exists
 # ─────────────────────────────────────────
 
 def process_contact(
@@ -191,7 +228,7 @@ def process_contact(
     """
     Legacy handler for CSV-uploaded contacts.
     Skips immediately if no email.
-    Does web research since contact came from CSV.
+    Does web research since no DB summary exists.
     """
     name          = contact.get("name", "")
     business      = contact.get("business_name", "")
@@ -215,12 +252,15 @@ def process_contact(
         research = research_business(business)
 
         say_fn(
-            f"✍️ Drafting for *{name}* at *{business}*..."
+            f"✍️ Drafting for *{name}* "
+            f"at *{business}*..."
         )
 
         full_research = ""
         if extra_context:
-            full_research += f"Context:\n{extra_context}\n\n"
+            full_research += (
+                f"Context:\n{extra_context}\n\n"
+            )
         full_research += f"Web research:\n{research}"
 
         draft = draft_outreach_email(
@@ -261,15 +301,9 @@ def process_contact(
 
 # ─────────────────────────────────────────
 # SEND APPROVED EMAIL
-# Updates draft + prospect status in DB
 # ─────────────────────────────────────────
 
 def send_approved_email(result: dict) -> bool:
-    """
-    Sends the email for an approved result.
-    Updates draft status → sent.
-    Updates prospect status → sent.
-    """
     contact  = result["contact"]
     draft_id = result.get("draft_id")
 
@@ -301,19 +335,12 @@ def send_approved_email(result: dict) -> bool:
 
 # ─────────────────────────────────────────
 # SKIP CONTACT
-# Marks draft as rejected
-# Prospect stays at draft_ready for retry
 # ─────────────────────────────────────────
 
 def skip_contact(
     result:   dict,
     feedback: str = None
 ):
-    """
-    Records a skipped/rejected draft.
-    Prospect stays at draft_ready — retryable
-    with !run draft_ready.
-    """
     contact  = result["contact"]
     draft_id = result.get("draft_id")
 
@@ -342,8 +369,6 @@ def skip_contact(
 
 # ─────────────────────────────────────────
 # SAVE REDRAFT
-# New version row in email_drafts
-# Old draft marked as rejected
 # ─────────────────────────────────────────
 
 def save_redraft(
@@ -352,11 +377,6 @@ def save_redraft(
     body:    str,
     draft:   str
 ) -> dict:
-    """
-    Saves a new draft version after CEO feedback.
-    Creates new email_drafts row (version + 1).
-    Marks old draft as rejected.
-    """
     contact     = result["contact"]
     prospect_id = contact.get("prospect_id")
 
@@ -409,16 +429,9 @@ def save_redraft(
 
 # ─────────────────────────────────────────
 # FORMAT DRAFT FOR SLACK
-# Strips HTML for clean Slack preview
-# Actual email still has full HTML links
 # ─────────────────────────────────────────
 
 def format_draft_for_slack(result: dict) -> str:
-    """
-    Formats draft into clean Slack approval message.
-    Strips HTML tags — Slack doesn't render them.
-    Actual email sent has full HTML hyperlinks.
-    """
     contact = result["contact"]
 
     # Strip HTML for Slack preview
@@ -454,7 +467,6 @@ def format_draft_for_slack(result: dict) -> str:
 
 # ─────────────────────────────────────────
 # GENERATE SUMMARY
-# Posted when outreach run completes
 # ─────────────────────────────────────────
 
 def generate_summary(
@@ -472,4 +484,4 @@ def generate_summary(
         f"• Failed:          {failed}\n\n"
         f"_Type *!pipeline* to see the full "
         f"prospect pipeline._"
-    )   
+    )
