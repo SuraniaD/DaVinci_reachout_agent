@@ -3,33 +3,40 @@ from interaction_log import log_action
 from datetime import datetime, timezone
 
 
-def _derive_segment(source_query: str) -> str:
+def _derive_segment(
+    location: str = None,
+    industry: str = None
+) -> str:
     """
-    Derives a clean segment label from source_query.
-    Strips number prefixes and trailing count hints.
-    e.g. "vegan restaurants Berlin, 20"
-      → "vegan restaurants berlin"
+    Derives segment as "location x industry".
+    Uses only whichever fields are present.
+    e.g. "Tokyo, Japan" + "plant-based restaurant"
+      → "tokyo, japan x plant-based restaurant"
+    e.g. "Tokyo, Japan" only
+      → "tokyo, japan"
     """
-    if not source_query:
+    loc = (location or "").strip().lower()
+    ind = (industry or "").strip().lower()
+
+    if loc in ["none", "null", "n/a", "unknown", ""]:
+        loc = ""
+    if ind in ["none", "null", "n/a", "unknown", ""]:
+        ind = ""
+
+    if loc and ind:
+        return f"{loc} x {ind}"
+    elif loc:
+        return loc
+    elif ind:
+        return ind
+    else:
         return "uncategorised"
-
-    import re
-    segment = source_query.strip()
-    segment = re.sub(r'^\d+\s+', '', segment)
-    segment = re.sub(
-        r',?\s*(list\s+of\s+)?\d+\s*$', '', segment
-    )
-    segment = re.sub(
-        r'\s+', ' ', segment
-    ).strip().lower()
-
-    return segment or "uncategorised"
 
 
 def add_prospect(prospect: dict) -> dict | None:
     """
     Writes one prospect to the prospects table.
-    Derives segment from source_query at insert time.
+    Derives segment from location x industry.
     Validates required fields. Deduplicates by name.
     """
     try:
@@ -76,8 +83,10 @@ def add_prospect(prospect: dict) -> dict | None:
             )
             return None
 
-        source_query = prospect.get("source_query") or ""
-        segment      = _derive_segment(source_query)
+        segment = _derive_segment(
+            location=prospect.get("location"),
+            industry=prospect.get("industry")
+        )
 
         row = {
             "business_name":    business_name,
@@ -87,7 +96,7 @@ def add_prospect(prospect: dict) -> dict | None:
             "location":         prospect.get("location") or None,
             "industry":         prospect.get("industry") or None,
             "research_summary": prospect.get("research_summary") or None,
-            "source_query":     source_query or None,
+            "source_query":     prospect.get("source_query") or None,
             "segment":          segment,
             "outreach_status":  "researched"
         }
@@ -214,17 +223,6 @@ def get_segment_summary() -> dict:
     """
     Returns prospect counts grouped by segment
     and outreach_status.
-
-    Returns:
-    {
-        "vegan restaurants berlin": {
-            "researched": 8,
-            "sent": 3,
-            "replied": 1,
-            "total": 12
-        },
-        ...
-    }
     """
     try:
         result = supabase.table("prospects") \
@@ -566,7 +564,7 @@ def format_segment_summary_for_slack(
 
     lines.append(
         "_Use *!run <segment>* to target a segment_\n"
-        "_e.g. *!run berlin* · *!run netherlands*_"
+        "_e.g. *!run japan* · *!run berlin*_"
     )
 
     return "\n".join(lines)
