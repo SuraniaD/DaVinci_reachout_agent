@@ -96,11 +96,9 @@ dexter_client = WebClient(
     token=os.environ.get("DEXTER_BOT_TOKEN")
 )
 
-approval_state  = {}
-queue_running   = set()
-
-# Per-user stop flags for campaign runs
-stop_requested  = set()
+approval_state = {}
+queue_running  = set()
+stop_requested = set()
 
 
 # ─────────────────────────────────────────
@@ -599,7 +597,6 @@ def handle_dexter_dm(event, say):
         status  = None
         segment = None
 
-        # !prospects <status> OR !prospects <segment>
         if len(parts) > 1:
             known_statuses = [
                 "researched", "draft_ready", "approved",
@@ -873,13 +870,13 @@ def start_outreach_run(
     user_id:  str,
     contacts: list[dict],
     say,
-    source:   str  = "csv",
-    segment:  str  = None
+    source:   str = "csv",
+    segment:  str = None
 ):
     print(
         f"🚀 [RILEY] Run ({source}) — "
         f"{len(contacts)} contacts"
-        f"{f\" segment='{segment}'\" if segment else ''}"
+        f"{(' segment=' + segment) if segment else ''}"
     )
     clear_run_state(user_id)
     stop_requested.discard(user_id)
@@ -887,7 +884,8 @@ def start_outreach_run(
     mode_msg = (
         "⚡ *Auto-send ON*"
         if is_auto_mode(user_id)
-        else "✋ *Approval mode ON* — "
+        else
+        "✋ *Approval mode ON* — "
         "I'll show each draft first."
     )
 
@@ -946,10 +944,8 @@ def process_next_contact(user_id: str, say):
         if user_id in stop_requested:
             state = approval_state.get(user_id, {})
             stats = state.get("stats", {})
-            total = (
-                stats.get("sent", 0) +
-                stats.get("skipped", 0) +
-                stats.get("failed", 0)
+            remaining = state.get(
+                "remaining_contacts", []
             )
             say(
                 f"⏹️ *Campaign stopped.*\n\n"
@@ -957,8 +953,8 @@ def process_next_contact(user_id: str, say):
                 f"• Sent: {stats.get('sent', 0)}\n"
                 f"• Skipped: {stats.get('skipped', 0)}\n"
                 f"• Failed: {stats.get('failed', 0)}\n\n"
-                f"_{len(state.get('remaining_contacts', []))} "
-                f"prospects not yet contacted._\n"
+                f"_{len(remaining)} prospects "
+                f"not yet contacted._\n"
                 f"_Type *!run* to start a new run._"
             )
             stop_requested.discard(user_id)
@@ -1166,6 +1162,7 @@ def handle_approval_reply(
 
     state["waiting"]        = False
     state["pending_result"] = None
+    print(f"🔓 [RILEY] waiting cleared")
 
     # ── APPROVE ──────────────────────────
     if text.lower().strip() == "approve":
@@ -1200,6 +1197,7 @@ def handle_approval_reply(
         return
 
     # ── REDRAFT WITH LEARNING ─────────────
+    print(f"✏️  [RILEY] Redraft: '{text[:80]}'")
     say("Got it — redrafting with your feedback...")
 
     from agents.riley import parse_draft
@@ -1214,6 +1212,11 @@ def handle_approval_reply(
         )
 
         new_subject, new_body = parse_draft(new_draft)
+
+        print(
+            f"✅ [RILEY] Redraft ready. "
+            f"Learned: '{learned}'"
+        )
 
         if learned:
             say(
@@ -1240,6 +1243,7 @@ def handle_approval_reply(
         )
         state["pending_result"] = result
         state["waiting"]        = True
+        print(f"🔒 [RILEY] Restored waiting")
 
 
 # ═══════════════════════════════════════════
@@ -1275,17 +1279,13 @@ def handle_riley_dm(event, say):
         return
 
     # ── STOP — highest priority ───────────
-    # Checked before everything else so it
-    # works during approval waits too
     if text.strip().upper() == "STOP":
         if user_id in approval_state:
             stop_requested.add(user_id)
             state = approval_state[user_id]
 
             if state.get("waiting"):
-                # Mid-approval — skip current draft
-                # then stop on next iteration
-                result  = state.get("pending_result")
+                result = state.get("pending_result")
                 if result:
                     skip_contact(result)
                 state["pending_result"] = None
@@ -1305,12 +1305,6 @@ def handle_riley_dm(event, say):
 
     # ── !run ─────────────────────────────
     if text.lower().startswith("!run"):
-        # Parse: !run [status] [segment]
-        # Examples:
-        #   !run
-        #   !run draft_ready
-        #   !run berlin
-        #   !run researched berlin
         parts   = text.split(None, 2)
         status  = "researched"
         segment = None
@@ -1326,10 +1320,7 @@ def handle_riley_dm(event, say):
                 if len(parts) >= 3:
                     segment = parts[2].strip()
             else:
-                # No status given — treat as segment
-                segment = " ".join(
-                    parts[1:]
-                ).strip()
+                segment = " ".join(parts[1:]).strip()
 
         print(
             f"🚀 [RILEY CMD] !run "
@@ -1375,9 +1366,12 @@ def handle_riley_dm(event, say):
             )
             return
 
+        seg_label = (
+            f" in *{segment}*" if segment else ""
+        )
         msg = (
             f"✅ Found *{len(with_email)} prospects*"
-            f"{f' in *{segment}*' if segment else ''}."
+            f"{seg_label}."
         )
         if without_email > 0:
             msg += (
@@ -1583,6 +1577,7 @@ def handle_riley_dm(event, say):
             return
 
     # ── GENERAL CHAT ─────────────────────
+    print(f"💬 [RILEY ROUTING] → chat")
     say("_Thinking..._")
     say(chat_with_riley(user_id, text))
 
@@ -1631,8 +1626,7 @@ def restore_interrupted_runs():
                         f"Progress: "
                         f"{sts.get('sent', 0)} sent · "
                         f"{sts.get('skipped', 0)} "
-                        f"skipped\n\n"
-                        f"Continuing now..."
+                        f"skipped\n\nContinuing now..."
                     )
                 )
 

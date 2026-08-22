@@ -7,16 +7,15 @@ def _derive_segment(source_query: str) -> str:
     """
     Derives a clean segment label from source_query.
     Strips number prefixes and trailing count hints.
-    e.g. "vegan restaurants Berlin, 20" → "vegan restaurants Berlin"
+    e.g. "vegan restaurants Berlin, 20"
+      → "vegan restaurants berlin"
     """
     if not source_query:
         return "uncategorised"
 
     import re
     segment = source_query.strip()
-    # Strip leading numbers e.g. "20 vegan..."
     segment = re.sub(r'^\d+\s+', '', segment)
-    # Strip trailing ", 20" or "list of 20" etc
     segment = re.sub(
         r',?\s*(list\s+of\s+)?\d+\s*$', '', segment
     )
@@ -30,9 +29,8 @@ def _derive_segment(source_query: str) -> str:
 def add_prospect(prospect: dict) -> dict | None:
     """
     Writes one prospect to the prospects table.
-    Derives segment from source_query.
-    Validates required fields before inserting.
-    Checks for duplicates by business_name first.
+    Derives segment from source_query at insert time.
+    Validates required fields. Deduplicates by name.
     """
     try:
         business_name = prospect.get("business_name")
@@ -164,7 +162,7 @@ def get_prospects_for_outreach(
             f"✅ [PROSPECT DB] Fetched "
             f"{len(rows)} prospects "
             f"status='{status}'"
-            f"{f\" segment~'{segment}'\" if segment else ''}"
+            f"{(' segment~' + segment) if segment else ''}"
         )
 
         return rows
@@ -184,6 +182,7 @@ def get_prospects(
     """
     Fetches prospects for pipeline display.
     Optional status and segment filters.
+    No email filter — shows full picture.
     """
     try:
         query = supabase.table("prospects") \
@@ -245,7 +244,6 @@ def get_segment_summary() -> dict:
             summary[seg][status] = \
                 summary[seg].get(status, 0) + 1
 
-        # Sort by total descending
         summary = dict(
             sorted(
                 summary.items(),
@@ -517,10 +515,6 @@ def format_prospects_for_slack(
 def format_segment_summary_for_slack(
     summary: dict
 ) -> str:
-    """
-    Formats segment summary for Slack display.
-    Shows each segment with counts per status.
-    """
     if not summary:
         return (
             "📊 No segments yet.\n"
@@ -546,7 +540,8 @@ def format_segment_summary_for_slack(
         v.get("total", 0) for v in summary.values()
     )
     lines = [
-        f"*📂 Segments* ({total_all} total prospects)\n"
+        f"*📂 Segments* "
+        f"({total_all} total prospects)\n"
     ]
 
     for seg, counts in summary.items():
@@ -571,7 +566,7 @@ def format_segment_summary_for_slack(
 
     lines.append(
         "_Use *!run <segment>* to target a segment_\n"
-        "_e.g.* !run berlin* · *!run netherlands*_"
+        "_e.g. *!run berlin* · *!run netherlands*_"
     )
 
     return "\n".join(lines)
