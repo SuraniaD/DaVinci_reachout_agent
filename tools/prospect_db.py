@@ -3,41 +3,149 @@ from interaction_log import log_action
 from datetime import datetime, timezone
 
 
-def _derive_segment(
-    location: str = None,
-    industry: str = None
-) -> str:
-    """
-    Derives segment as "location x industry".
-    Uses only whichever fields are present.
-    e.g. "Tokyo, Japan" + "plant-based restaurant"
-      → "tokyo, japan x plant-based restaurant"
-    e.g. "Tokyo, Japan" only
-      → "tokyo, japan"
-    """
-    loc = (location or "").strip().lower()
-    ind = (industry or "").strip().lower()
+# ─────────────────────────────────────────
+# REGION EXTRACTION
+# Maps any location string to a country label.
+# Used at insert time and for display.
+# ─────────────────────────────────────────
 
-    if loc in ["none", "null", "n/a", "unknown", ""]:
-        loc = ""
-    if ind in ["none", "null", "n/a", "unknown", ""]:
-        ind = ""
+REGION_MAP = {
+    "japan": [
+        "japan", "tokyo", "osaka", "kyoto", "nagoya",
+        "fukuoka", "sapporo", "yokohama", "tochigi",
+        "uji", "utsunomiya", "toyohashi", "hiroshima",
+        "sendai", "chiba", "kawasaki", "saitama",
+        "nagano", "okinawa"
+    ],
+    "usa": [
+        "usa", ", us", "united states", "new york",
+        "chicago", "los angeles", "san francisco",
+        "seattle", "boston", "florida", "texas",
+        "california", "austin", "miami", "portland",
+        "denver", "atlanta", "washington", "brooklyn",
+        "lawrenceville", "boise", "raleigh", "omaha",
+        "michigan", "maryland", "new jersey", "boulder",
+        "emeryville", "cranford", "redwood city",
+        "yountville", "monterey", "carmel", "berkeley",
+        "pleasanton", "addison", "plano", "denton",
+        "mesquite", "beaumont", "orange park", "naples",
+        "boca raton", "fort lauderdale", "orlando",
+        "panama city", "america", "american"
+    ],
+    "uk": [
+        "united kingdom", " uk", "uk,", "england",
+        "london", "manchester", "bristol", "liverpool",
+        "scotland", "birmingham", "corby",
+        "south derbyshire", "britain", "welsh", "wales"
+    ],
+    "germany": [
+        "germany", "deutschland", "berlin", "munich",
+        "hamburg", "frankfurt", "mainz", "cologne",
+        "düsseldorf", "stuttgart"
+    ],
+    "australia": [
+        "australia", "sydney", "melbourne", "brisbane",
+        "perth", "adelaide", "gold coast", "canberra",
+        "blue mountains", "south australia",
+        "western australia", "port lincoln"
+    ],
+    "netherlands": [
+        "netherlands", "holland", "amsterdam",
+        "rotterdam", "hilversum", "zwolle", "dutch"
+    ],
+    "france": [
+        "france", "paris", "nice", "lyon", "marseille",
+        "french", "bordeaux"
+    ],
+    "thailand": [
+        "thailand", "bangkok", "chiang mai", "phuket",
+        "mueang", "thai"
+    ],
+    "spain": [
+        "spain", "madrid", "barcelona", "seville",
+        "spanish", "valencia"
+    ],
+    "sweden": [
+        "sweden", "stockholm", "gothenburg", "malmo",
+        "swedish"
+    ],
+    "belgium": [
+        "belgium", "brussels", "wevelgem", "antwerp",
+        "belgian", "ghent"
+    ],
+    "denmark": [
+        "denmark", "copenhagen", "aarhus", "danish"
+    ],
+    "austria": [
+        "austria", "vienna", "austrian", "graz"
+    ],
+    "ireland": [
+        "ireland", "dublin", "kildare", "irish"
+    ],
+    "italy": [
+        "italy", "milan", "rome", "florence",
+        "castelvolturno", "naples", "italian"
+    ],
+    "canada": [
+        "canada", "toronto", "vancouver", "montreal",
+        "canadian"
+    ],
+    "india": [
+        "india", "mumbai", "delhi", "bangalore",
+        "udaipur", "chennai", "indian"
+    ],
+    "taiwan": [
+        "taiwan", "taipei"
+    ],
+    "russia": [
+        "russia", "moscow", "russian"
+    ],
+    "europe": [
+        "europe", "european"
+    ],
+    "global": [
+        "global", "worldwide", "international"
+    ]
+}
 
-    if loc and ind:
-        return f"{loc} x {ind}"
-    elif loc:
-        return loc
-    elif ind:
-        return ind
-    else:
-        return "uncategorised"
+
+def extract_region(location: str) -> str:
+    """
+    Maps a location string to a country/region label.
+    Checks most specific matches first.
+    Falls back to 'unknown' if nothing matches.
+    """
+    if not location or \
+       str(location).strip().lower() in [
+           "", "none", "null", "n/a", "unknown"
+       ]:
+        return "unknown"
+
+    loc = location.strip().lower()
+
+    # Check each region — specific countries first,
+    # generic (europe, global) last
+    priority = [
+        "japan", "usa", "uk", "germany", "australia",
+        "netherlands", "france", "thailand", "spain",
+        "sweden", "belgium", "denmark", "austria",
+        "ireland", "italy", "canada", "india",
+        "taiwan", "russia", "europe", "global"
+    ]
+
+    for region in priority:
+        keywords = REGION_MAP.get(region, [])
+        if any(kw in loc for kw in keywords):
+            return region
+
+    return "unknown"
 
 
 def add_prospect(prospect: dict) -> dict | None:
     """
     Writes one prospect to the prospects table.
-    Derives segment from location x industry.
-    Validates required fields. Deduplicates by name.
+    Derives region from location field.
+    Sets segment = region for geographic grouping.
     """
     try:
         business_name = prospect.get("business_name")
@@ -83,9 +191,8 @@ def add_prospect(prospect: dict) -> dict | None:
             )
             return None
 
-        segment = _derive_segment(
-            location=prospect.get("location"),
-            industry=prospect.get("industry")
+        region = extract_region(
+            prospect.get("location", "")
         )
 
         row = {
@@ -97,7 +204,8 @@ def add_prospect(prospect: dict) -> dict | None:
             "industry":         prospect.get("industry") or None,
             "research_summary": prospect.get("research_summary") or None,
             "source_query":     prospect.get("source_query") or None,
-            "segment":          segment,
+            "segment":          region,
+            "region":           region,
             "outreach_status":  "researched"
         }
 
@@ -111,14 +219,14 @@ def add_prospect(prospect: dict) -> dict | None:
                 f"✅ [PROSPECT DB] Added: "
                 f"'{business_name}' "
                 f"(ID: {inserted['id']}) "
-                f"segment: '{segment}' "
+                f"region: '{region}' "
                 f"email: {row.get('email', 'none')}"
             )
             log_action(
                 action_type="prospect_added",
                 business_name=business_name,
                 detail=(
-                    f"segment: {segment} — "
+                    f"region: {region} — "
                     f"email: "
                     f"{prospect.get('email') or 'unknown'}"
                 )
@@ -140,10 +248,8 @@ def get_prospects_for_outreach(
 ) -> list[dict]:
     """
     Fetches prospects ready for Riley.
-    Filters at DB level:
-    - must have valid email
-    - must have research_summary
-    Optional segment filter for targeted campaigns.
+    Filters at DB level — email + summary required.
+    Optional region/segment filter.
     """
     try:
         query = supabase.table("prospects") \
@@ -160,9 +266,10 @@ def get_prospects_for_outreach(
             .limit(limit)
 
         if segment:
-            query = query.ilike(
-                "segment", f"%{segment}%"
-            )
+            # Match against region column
+            # for clean country-level filtering
+            seg_clean = segment.strip().lower()
+            query = query.eq("region", seg_clean)
 
         result = query.execute()
         rows   = result.data
@@ -171,7 +278,7 @@ def get_prospects_for_outreach(
             f"✅ [PROSPECT DB] Fetched "
             f"{len(rows)} prospects "
             f"status='{status}'"
-            f"{(' segment~' + segment) if segment else ''}"
+            f"{(' region=' + segment) if segment else ''}"
         )
 
         return rows
@@ -190,14 +297,14 @@ def get_prospects(
 ) -> list[dict]:
     """
     Fetches prospects for pipeline display.
-    Optional status and segment filters.
-    No email filter — shows full picture.
+    Optional status and region filters.
     """
     try:
         query = supabase.table("prospects") \
             .select(
                 "id, business_name, contact_name, "
-                "email, location, industry, segment, "
+                "email, location, industry, "
+                "segment, region, "
                 "outreach_status, created_at"
             ) \
             .order("created_at", desc=True) \
@@ -207,9 +314,8 @@ def get_prospects(
             query = query.eq("outreach_status", status)
 
         if segment:
-            query = query.ilike(
-                "segment", f"%{segment}%"
-            )
+            seg_clean = segment.strip().lower()
+            query = query.eq("region", seg_clean)
 
         result = query.execute()
         return result.data
@@ -221,31 +327,53 @@ def get_prospects(
 
 def get_segment_summary() -> dict:
     """
-    Returns prospect counts grouped by segment
+    Returns prospect counts grouped by region
     and outreach_status.
+    One row per country — clean for outreach planning.
+
+    Returns:
+    {
+        "japan": {
+            "researched": 18,
+            "sent": 19,
+            "skipped": 5,
+            "total": 42
+        },
+        ...
+    }
     """
     try:
         result = supabase.table("prospects") \
-            .select("segment, outreach_status") \
+            .select("region, outreach_status") \
             .execute()
 
         summary = {}
         for row in result.data:
-            seg    = row.get("segment") or "uncategorised"
-            status = row.get("outreach_status", "unknown")
+            region = row.get("region") or "unknown"
+            status = row.get(
+                "outreach_status", "unknown"
+            )
 
-            if seg not in summary:
-                summary[seg] = {"total": 0}
+            if region not in summary:
+                summary[region] = {"total": 0}
 
-            summary[seg]["total"] = \
-                summary[seg].get("total", 0) + 1
-            summary[seg][status] = \
-                summary[seg].get(status, 0) + 1
+            summary[region]["total"] = \
+                summary[region].get("total", 0) + 1
+            summary[region][status] = \
+                summary[region].get(status, 0) + 1
+
+        # Sort by total descending
+        # put unknown at the bottom
+        def sort_key(item):
+            k, v = item
+            if k == "unknown":
+                return -1
+            return v.get("total", 0)
 
         summary = dict(
             sorted(
                 summary.items(),
-                key=lambda x: x[1].get("total", 0),
+                key=sort_key,
                 reverse=True
             )
         )
@@ -490,21 +618,21 @@ def format_prospects_for_slack(
     lines = [f"*{title}* ({len(prospects)} total)\n"]
 
     for p in prospects:
-        icon    = status_icons.get(
+        icon   = status_icons.get(
             p["outreach_status"], "•"
         )
-        name    = p["business_name"]
-        loc     = p.get("location") or ""
-        status  = p["outreach_status"].replace("_", " ")
-        email   = p.get("email") or "no email"
-        segment = p.get("segment") or ""
+        name   = p["business_name"]
+        loc    = p.get("location") or ""
+        status = p["outreach_status"].replace("_", " ")
+        email  = p.get("email") or "no email"
+        region = p.get("region") or ""
 
         line = f"{icon} *{name}*"
         if loc:
             line += f" — {loc}"
         line += f"\n   _{status}_ · {email}"
-        if segment:
-            line += f"\n   📂 {segment}"
+        if region and region != "unknown":
+            line += f"\n   🌍 {region}"
         lines.append(line)
 
     return "\n\n".join(lines)
@@ -513,6 +641,11 @@ def format_prospects_for_slack(
 def format_segment_summary_for_slack(
     summary: dict
 ) -> str:
+    """
+    Formats geographic segment summary for Slack.
+    One row per country, sorted by total prospects.
+    Shows status breakdown inline.
+    """
     if not summary:
         return (
             "📊 No segments yet.\n"
@@ -534,37 +667,78 @@ def format_segment_summary_for_slack(
         "sent", "replied", "closed", "skipped"
     ]
 
+    country_flags = {
+        "japan":       "🇯🇵",
+        "usa":         "🇺🇸",
+        "uk":          "🇬🇧",
+        "germany":     "🇩🇪",
+        "australia":   "🇦🇺",
+        "netherlands": "🇳🇱",
+        "france":      "🇫🇷",
+        "thailand":    "🇹🇭",
+        "spain":       "🇪🇸",
+        "sweden":      "🇸🇪",
+        "belgium":     "🇧🇪",
+        "denmark":     "🇩🇰",
+        "austria":     "🇦🇹",
+        "ireland":     "🇮🇪",
+        "italy":       "🇮🇹",
+        "canada":      "🇨🇦",
+        "india":       "🇮🇳",
+        "taiwan":      "🇹🇼",
+        "russia":      "🇷🇺",
+        "europe":      "🌍",
+        "global":      "🌐",
+        "unknown":     "❓"
+    }
+
     total_all = sum(
         v.get("total", 0) for v in summary.values()
+        if isinstance(v, dict)
     )
+
     lines = [
-        f"*📂 Segments* "
+        f"*🌍 Geographic Segments* "
         f"({total_all} total prospects)\n"
     ]
 
-    for seg, counts in summary.items():
-        total = counts.get("total", 0)
-        lines.append(f"*{seg}* — {total} prospects")
+    for region, counts in summary.items():
+        if region == "unknown":
+            continue
 
+        total = counts.get("total", 0)
+        flag  = country_flags.get(region, "🌐")
+
+        # Build compact status line
         status_parts = []
         for s in status_order:
             if s in counts and s != "total":
                 icon = status_icons.get(s, "•")
                 status_parts.append(
-                    f"{icon} {s.replace('_', ' ')}: "
-                    f"{counts[s]}"
+                    f"{icon} {counts[s]}"
                 )
 
-        if status_parts:
+        status_str = " · ".join(status_parts)
+        lines.append(
+            f"{flag} *{region.upper()}* "
+            f"— {total} prospects\n"
+            f"   {status_str}"
+        )
+
+    # Unknown at the bottom if any
+    if "unknown" in summary:
+        unk = summary["unknown"]
+        total = unk.get("total", 0)
+        if total > 0:
             lines.append(
-                "   " + " · ".join(status_parts)
+                f"\n❓ *Unknown location* "
+                f"— {total} prospects"
             )
 
-        lines.append("")
-
     lines.append(
-        "_Use *!run <segment>* to target a segment_\n"
-        "_e.g. *!run japan* · *!run berlin*_"
+        f"\n_*!run <country>* to start a campaign_\n"
+        f"_e.g. *!run japan* · "
+        f"*!run germany* · *!run usa*_"
     )
 
     return "\n".join(lines)
@@ -607,7 +781,7 @@ def format_pipeline_summary_for_slack(
             lines.append(f"{icon} *{label}:* {count}")
 
     lines.append(
-        f"\n_*!segments* to see by segment_\n"
+        f"\n_*!segments* to see by country_\n"
         f"_*!pipeline <status>* to filter by status_"
     )
 
