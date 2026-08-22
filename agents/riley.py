@@ -31,25 +31,21 @@ WHEN THE CEO GIVES FEEDBACK ON AN EMAIL DRAFT:
 - Confirm you have saved it as a preference for future drafts
 
 COMMANDS:
-- !reset          → confirm memory cleared
-- !status         → summarise recent outreach activity
-- !automode on    → confirm auto-send is on
-- !automode off   → confirm approval mode is on
-- !showprefs      → list all saved preferences
-- !resetprefs     → clear all saved preferences
-- !resetrun       → cancel current outreach run
-- !run            → start outreach from DB prospects
-- !pipeline       → show prospect pipeline
+- !reset            → confirm memory cleared
+- !status           → summarise recent outreach activity
+- !automode on/off  → toggle auto-send mode
+- !showprefs        → list all saved preferences
+- !resetprefs       → clear all saved preferences
+- !resetrun         → cancel current outreach run
+- !run              → start outreach from DB prospects
+- !run <segment>    → run outreach for one segment only
+- !pipeline         → show prospect pipeline summary
+- !segments         → show all segments with stats
+- STOP              → stop current campaign after this draft
 """
 
 DAILY_TOKEN_LIMIT   = 500_000
 session_tokens_used = 0
-
-# ─────────────────────────────────────────
-# HARDCODED LINKS
-# Always injected by parse_draft
-# Never left to the model
-# ─────────────────────────────────────────
 
 BOOKING_LINK = (
     "https://cal.com/deepanshu-surania/"
@@ -86,10 +82,6 @@ def _extract_preference(
     user_id:  str,
     feedback: str
 ) -> str | None:
-    """
-    Uses Groq to extract a reusable writing rule
-    from CEO feedback. Returns rule string or None.
-    """
     prompt = f"""
 The CEO gave this feedback on an outreach email draft:
 "{feedback}"
@@ -209,31 +201,20 @@ def _load_skill(filename: str) -> str:
     )
 
     return f"""
-Draft a cold outreach email for DaVinci AI.
-DaVinci AI automates business workflows with AI agents.
-Max 120 words. Be specific and human.
-Two paragraphs separated by a blank line.
-End with exactly:
-{CTA_LINE}
+You are Riley at DaVinci AI.
+Write a short cold outreach email (2 paragraphs, max 100 words).
+Paragraph 1: specific hook about the prospect's business.
+Paragraph 2: what DaVinci AI does and why it's relevant.
 
-{SIGNOFF_LINE}
+Output format — follow exactly:
+SUBJECT: <subject line>
 
-Format:
-SUBJECT: <subject line here>
 BODY:
 <paragraph 1>
 
 <paragraph 2>
-
-{CTA_LINE}
-
-{SIGNOFF_LINE}
 """
 
-
-# ─────────────────────────────────────────
-# GENERAL CHAT
-# ─────────────────────────────────────────
 
 def chat_with_riley(
     user_id:      str,
@@ -275,20 +256,12 @@ def chat_with_riley(
         return f"Sorry, hit an error: {e}."
 
 
-# ─────────────────────────────────────────
-# DRAFT OUTREACH EMAIL
-# ─────────────────────────────────────────
-
 def draft_outreach_email(
     user_id:       str,
     contact_name:  str,
     business_name: str,
     research:      str
 ) -> str:
-    """
-    Drafts a personalised outreach email.
-    Preferences injected at top of prompt.
-    """
     email_skill = _load_skill("email_template.txt")
 
     from tools.preferences import build_preferences_block
@@ -304,7 +277,10 @@ def draft_outreach_email(
 Business name: {business_name}
 
 Research:
-{research[:800]}"""
+{research[:800]}
+
+Write the email now. Follow the output format exactly.
+Start with SUBJECT: on the first line."""
 
     log_action(
         action_type="draft",
@@ -334,7 +310,6 @@ Research:
             f"{business_name} — "
             f"{tokens_used} tokens · {pct:.1f}% used"
         )
-
         print(
             f"📝 [DRAFT RAW] '{business_name}':\n"
             f"{'─'*40}\n{draft}\n{'─'*40}"
@@ -348,10 +323,6 @@ Research:
         raise Exception(f"Could not draft email: {e}")
 
 
-# ─────────────────────────────────────────
-# DRAFT WITH FEEDBACK
-# ─────────────────────────────────────────
-
 def draft_with_feedback(
     user_id:        str,
     feedback:       str,
@@ -359,11 +330,6 @@ def draft_with_feedback(
     contact_name:   str,
     business_name:  str
 ) -> tuple[str, str | None]:
-    """
-    Redrafts incorporating CEO feedback.
-    Saves preference FIRST then redrafts with
-    updated prefs so new rule applies immediately.
-    """
     learned = None
     if _looks_like_feedback(feedback):
         preference = _extract_preference(
@@ -382,19 +348,16 @@ def draft_with_feedback(
     prefs_block = build_preferences_block(user_id)
     if prefs_block:
         email_skill = prefs_block + "\n\n" + email_skill
-        print(
-            f"🧠 [REDRAFT] Preferences injected "
-            f"({'includes new rule' if learned else 'existing'})"
-        )
 
     task = f"""CEO feedback on this draft: "{feedback}"
 
 Original draft:
 {original_draft}
 
-Redraft the email applying this feedback exactly.
-Keep SUBJECT then BODY format.
-Two paragraphs separated by a blank line."""
+Rewrite the email applying this feedback exactly.
+Follow the output format — start with SUBJECT: on the
+first line, then a blank line, then BODY: on its own line,
+then the email body in two paragraphs."""
 
     try:
         new_draft, tokens_used = _call_groq_with_retry(
@@ -409,15 +372,6 @@ Two paragraphs separated by a blank line."""
         global session_tokens_used
         session_tokens_used += tokens_used
 
-        pct = (
-            session_tokens_used / DAILY_TOKEN_LIMIT
-        ) * 100
-        print(
-            f"✍️  [REDRAFT] {contact_name} @ "
-            f"{business_name} — "
-            f"{tokens_used} tokens · {pct:.1f}% used"
-        )
-
         add_message(
             "riley", user_id, "assistant", new_draft
         )
@@ -428,51 +382,40 @@ Two paragraphs separated by a blank line."""
         raise Exception(f"Could not redraft: {e}")
 
 
-# ─────────────────────────────────────────
-# PARSE DRAFT
-# Robust parser — handles model output variations
-# Falls back gracefully if markers are missing
-# ─────────────────────────────────────────
-
 def parse_draft(draft: str) -> tuple[str, str]:
     """
-    Splits Riley's raw draft into subject and body.
+    Splits raw draft into subject and body.
 
-    Handles these model output variations:
-    - SUBJECT: ... BODY: ... (standard)
-    - Subject: ... (no BODY: marker)
-    - No markers at all (plain text)
+    Three-level fallback:
+    1. SUBJECT: + BODY: markers (standard)
+    2. SUBJECT: found but no BODY: — use remaining lines
+    3. No markers — use full draft as body
 
-    Strips whatever CTA/signoff the model wrote.
+    Strips standalone CTA/signoff lines only.
     Re-attaches correct HTML links exactly once.
-
-    Falls back to using the full draft as body
-    rather than silently returning empty.
     """
-    # Strip token footer if present
+    # Strip token footer
     divider = "─────────────────────"
     if divider in draft:
         draft = draft[:draft.index(divider)].strip()
 
-    lines      = draft.strip().split("\n")
-    subject    = ""
+    lines   = draft.strip().split("\n")
+    subject = ""
     body_lines = []
     in_body    = False
+    subject_line_idx = None
 
-    for line in lines:
+    for i, line in enumerate(lines):
         stripped = line.strip()
 
-        # Extract SUBJECT line (case insensitive)
         if re.match(r'^subject\s*:', stripped, re.I) \
            and not subject:
             subject = re.split(
                 r'subject\s*:', stripped, flags=re.I
-            )[1].strip()
-            # Remove surrounding quotes if model adds them
-            subject = subject.strip('"\'')
+            )[1].strip().strip('"\'')
+            subject_line_idx = i
             continue
 
-        # Start capturing body after BODY: marker
         if re.match(r'^body\s*:', stripped, re.I):
             in_body   = True
             remainder = re.split(
@@ -485,30 +428,16 @@ def parse_draft(draft: str) -> tuple[str, str]:
         if in_body:
             body_lines.append(line)
 
-    # ── FALLBACK: no BODY: marker found ──
-    # Use all lines after the SUBJECT line as body.
-    # This handles models that write:
-    #   SUBJECT: xxx
-    #   <blank>
-    #   <body text directly>
-    if not body_lines and subject:
+    # ── FALLBACK 1: SUBJECT found, no BODY: ──
+    if not body_lines and subject_line_idx is not None:
         print(
-            "⚠️  [PARSE] No BODY: marker found — "
-            "using lines after SUBJECT as body"
+            "⚠️  [PARSE] No BODY: marker — "
+            "using lines after SUBJECT"
         )
-        found_subject = False
-        for line in lines:
-            stripped = line.strip()
-            if re.match(
-                r'^subject\s*:', stripped, re.I
-            ):
-                found_subject = True
-                continue
-            if found_subject:
-                body_lines.append(line)
+        for line in lines[subject_line_idx + 1:]:
+            body_lines.append(line)
 
-    # ── FALLBACK: no markers at all ──────
-    # Use entire draft as body and generate subject
+    # ── FALLBACK 2: no markers at all ────────
     if not body_lines and not subject:
         print(
             "⚠️  [PARSE] No markers found — "
@@ -523,60 +452,59 @@ def parse_draft(draft: str) -> tuple[str, str]:
     if not body:
         body = draft.strip()
 
-    # ── STRIP CTA AND SIGN-OFF ────────────
-    # Remove whatever the model wrote so we can
-    # re-attach the correct hardcoded HTML version
+    # ── STRIP STANDALONE CTA / SIGNOFF LINES ─
+    # Only strip lines that are ENTIRELY a CTA
+    # or signoff — not lines that contain a call
+    # reference mid-paragraph
 
     cta_patterns = [
-        r'worth a quick.*?call\??',
-        r'15.minute call',
-        r'schedule a call',
-        r'book a call',
-        r'hop on a call',
-        r'discovery call',
-        r'cal\.com\S*',
-        r'overlayCalendar\S*',
-        r'quick call\??',
-        r'have a call\??',
-        r'jump on a call\??',
+        r'^worth a quick.*?call\??\.?$',
+        r'^would you be open to a.*?call\??\.?$',
+        r'^(can we|shall we|let\'s) (hop|jump|get) on',
+        r'^schedule a call',
+        r'^book a call',
+        r'^happy to (jump|hop) on',
+        r'^15.minute call',
+        r'^cal\.com',
+        r'overlayCalendar',
     ]
 
     signoff_patterns = [
-        r'riley,?\s*davinci\s*ai\.?',
-        r'riley,?\s*<a\s.*?</a>',
-        r'riley,?\s*https?://\S+',
-        r'davinciai\.agency',
+        r'^riley,?\s*davinci\s*ai\.?$',
         r'^riley,?\s*$',
         r'^- riley$',
         r'^— riley$',
+        r'^riley,?\s*https?://\S+$',
+        r'davinciai\.agency',
+        r'^riley,?\s*<a\s',
     ]
 
     cleaned_lines = []
     for line in body.split("\n"):
-        line_stripped = line.strip()
-        line_lower    = line_stripped.lower()
+        stripped   = line.strip()
+        lower      = stripped.lower()
 
-        # Check CTA patterns
         is_cta = any(
-            re.search(p, line_lower)
+            re.match(p, lower)
             for p in cta_patterns
+        ) or "overlayCalendar" in line
+
+        is_signoff = any(
+            re.search(p, lower, re.I)
+            for p in signoff_patterns
         )
+
         if is_cta:
             print(
                 f"🧹 [PARSE] CTA stripped: "
-                f"'{line_stripped[:60]}'"
+                f"'{stripped[:60]}'"
             )
             continue
 
-        # Check signoff patterns
-        is_signoff = any(
-            re.search(p, line_lower, re.I)
-            for p in signoff_patterns
-        )
         if is_signoff:
             print(
                 f"🧹 [PARSE] Signoff stripped: "
-                f"'{line_stripped[:60]}'"
+                f"'{stripped[:60]}'"
             )
             continue
 
@@ -585,11 +513,10 @@ def parse_draft(draft: str) -> tuple[str, str]:
     body = "\n".join(cleaned_lines).strip()
     body = body.rstrip(",. \n")
 
-    # ── LOG WHAT WE'RE WORKING WITH ──────
     print(
         f"📝 [PARSE] subject='{subject}' "
         f"body_chars={len(body)} "
-        f"body_preview='{body[:80]}'"
+        f"preview='{body[:80]}'"
     )
 
     # Re-attach correct HTML links exactly once

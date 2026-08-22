@@ -83,3 +83,23 @@ BODY:
 Worth a quick <a href="https://cal.com/deepanshu-surania/discovery-call?overlayCalendar=true">15-minute call</a>?
 
 Riley, <a href="https://davinciai.agency">DaVinci AI</a>
+
+EXAMPLE — this is exactly what a correct output looks like:
+-----------------------------------------------------------
+SUBJECT: Quick idea for The Green Kitchen
+
+BODY:
+Noticed The Green Kitchen has been expanding its catering
+arm alongside the restaurant — that kind of growth usually
+means the admin behind it (order tracking, supplier emails,
+client follow-ups) quietly starts eating into the day.
+
+At DaVinci AI we build agent systems that handle exactly
+that kind of back-office work. For a business like yours
+we'd typically automate wholesale order management,
+catering client follow-ups, and supplier communication —
+so your team stays focused on the food.
+
+Worth a quick <a href="https://cal.com/deepanshu-surania/discovery-call?overlayCalendar=true">15-minute call</a>?
+
+Riley, <a href="https://davinciai.agency">DaVinci AI</a>

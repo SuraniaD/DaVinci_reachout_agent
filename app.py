@@ -54,7 +54,9 @@ from tools.prospect_db import (
     complete_research_session,
     format_prospects_for_slack,
     format_pipeline_summary_for_slack,
-    get_pipeline_summary
+    format_segment_summary_for_slack,
+    get_pipeline_summary,
+    get_segment_summary
 )
 from tools.research_queue import (
     save_queue,
@@ -94,11 +96,11 @@ dexter_client = WebClient(
     token=os.environ.get("DEXTER_BOT_TOKEN")
 )
 
-approval_state = {}
+approval_state  = {}
+queue_running   = set()
 
-# Tracks which users have an active queue runner
-# so we don't start duplicate threads
-queue_running = set()
+# Per-user stop flags for campaign runs
+stop_requested  = set()
 
 
 # ─────────────────────────────────────────
@@ -152,27 +154,20 @@ def _learn_from_approval(
 # ─────────────────────────────────────────
 
 def _parse_bullet_list(text: str) -> list[str]:
-    """
-    Extracts instructions from a bulleted list.
-    Supports: • - * and numbered lists (1. 2. etc)
-    Returns list of clean instruction strings.
-    """
     import re as _re
     lines  = text.strip().split("\n")
     result = []
 
     for line in lines:
-        line = line.strip()
+        line    = line.strip()
         if not line:
             continue
-
         cleaned = _re.sub(
             r'^[\•\-\*\–\—]\s*', '', line
         ).strip()
         cleaned = _re.sub(
             r'^\d+[\.\)]\s*', '', cleaned
         ).strip()
-
         if cleaned and len(cleaned) > 3:
             result.append(cleaned)
 
@@ -180,20 +175,15 @@ def _parse_bullet_list(text: str) -> list[str]:
 
 
 def _is_bullet_list(text: str) -> bool:
-    """
-    Returns True if message looks like a bulleted
-    list of research instructions.
-    Needs at least 2 lines starting with bullet markers.
-    """
     import re as _re
-    lines = [l.strip() for l in text.split("\n")
-             if l.strip()]
-
+    lines = [
+        l.strip() for l in text.split("\n")
+        if l.strip()
+    ]
     bullet_lines = sum(
         1 for l in lines
         if _re.match(r'^[\•\-\*\–\—\d]', l)
     )
-
     return bullet_lines >= 2
 
 
@@ -208,7 +198,6 @@ def _run_research(
     industry:    str = None,
     location:    str = None
 ):
-    """Single research run — no queue involved."""
     def _run():
         session_id = start_research_session(
             user_id, instruction
@@ -331,23 +320,9 @@ def _run_research(
 
 # ═══════════════════════════════════════════
 # DEXTER — QUEUE RUNNER
-# Processes instructions one by one.
-# On daily rate limit: checks every hour,
-# posts Slack update each check, auto-resumes.
-# Survives restarts via DB persistence.
 # ═══════════════════════════════════════════
 
 def _run_queue(user_id: str, say):
-    """
-    Processes the research queue one item at a time.
-
-    Rate limit behaviour:
-    - Detects daily quota exhaustion
-    - Waits 1 hour, then tests if quota reset
-    - Posts a Slack message each hourly check
-    - Resumes automatically when quota is back
-    - Queue position saved in DB — survives restarts
-    """
     if user_id in queue_running:
         print(
             f"⚠️  [QUEUE] Already running for {user_id}"
@@ -423,26 +398,19 @@ def _run_queue(user_id: str, say):
                 except Exception as e:
                     err_str = str(e).lower()
 
-                    is_rate_limit = any(w in err_str for w in [
-                        "rate_limit",
-                        "rate limit",
-                        "quota",
-                        "tokens per day",
-                        "daily limit",
-                        "exceeded"
-                    ])
+                    is_rate_limit = any(
+                        w in err_str for w in [
+                            "rate_limit", "rate limit",
+                            "quota", "tokens per day",
+                            "daily limit", "exceeded"
+                        ]
+                    )
 
                     if is_rate_limit:
-                        # ── DAILY LIMIT HIT ───────────
-                        # Do NOT mark as failed —
-                        # it will be retried after wait.
-                        # Check every hour until reset.
                         rate_limited = True
-
                         complete_research_session(
                             session_id, 0, "failed"
                         )
-
                         say(
                             f"🔴 *Daily research limit reached.*\n\n"
                             f"The 70B model quota resets every 24 hours. "
@@ -453,26 +421,11 @@ def _run_queue(user_id: str, say):
                             f"still in queue — nothing lost._"
                         )
 
-                        print(
-                            f"🔴 [QUEUE] Daily limit hit "
-                            f"for {user_id} — "
-                            f"starting hourly checks"
-                        )
-
-                        # Hourly retry loop
                         check_count = 0
                         while True:
-                            time.sleep(3600)  # 1 hour
-
+                            time.sleep(3600)
                             check_count += 1
-                            print(
-                                f"🔁 [QUEUE] Rate limit "
-                                f"check #{check_count} "
-                                f"for {user_id}"
-                            )
 
-                            # Test call — 5 tokens only
-                            # to check if quota reset
                             try:
                                 from groq import Groq
                                 test_client = Groq(
@@ -488,37 +441,26 @@ def _run_queue(user_id: str, say):
                                     }],
                                     max_tokens=5
                                 )
-
-                                # Success — quota has reset
                                 say(
-                                    f"🟢 *Research quota restored!*\n\n"
+                                    f"🟢 *Research quota restored!*\n"
                                     f"Resuming queue — "
                                     f"*{total_left} item"
                                     f"{'s' if total_left != 1 else ''} "
                                     f"remaining*..."
                                 )
-                                print(
-                                    f"✅ [QUEUE] Quota restored "
-                                    f"after {check_count}h"
-                                )
-                                break  # Resume outer loop
+                                break
 
                             except Exception as test_err:
                                 test_str = str(
                                     test_err
                                 ).lower()
-
                                 still_limited = any(
                                     w in test_str for w in [
                                         "rate_limit",
-                                        "rate limit",
                                         "quota",
-                                        "tokens per day",
-                                        "daily limit",
                                         "exceeded"
                                     ]
                                 )
-
                                 if still_limited:
                                     say(
                                         f"⏳ *Still rate limited* "
@@ -528,27 +470,16 @@ def _run_queue(user_id: str, say):
                                         f"{'s' if total_left != 1 else ''} "
                                         f"queued._"
                                     )
-                                    print(
-                                        f"⏳ [QUEUE] Still limited "
-                                        f"after {check_count}h"
-                                    )
                                     continue
-
                                 else:
-                                    # Different error — proceed anyway
                                     say(
                                         f"⚠️ Check error: "
                                         f"{str(test_err)[:80]}\n"
                                         f"Attempting to resume..."
                                     )
-                                    print(
-                                        f"⚠️ [QUEUE] Non-limit error "
-                                        f"on check: {test_err}"
-                                    )
                                     break
 
                     else:
-                        # Real error — mark failed, skip
                         mark_failed(queue_id, str(e))
                         complete_research_session(
                             session_id, 0, "failed"
@@ -558,13 +489,8 @@ def _run_queue(user_id: str, say):
                             f"Error: {str(e)[:100]}\n"
                             f"Moving to next item..."
                         )
-                        print(
-                            f"❌ [QUEUE] Item failed: "
-                            f"{str(e)[:80]}"
-                        )
 
                 if not rate_limited:
-                    # Brief pause between requests
                     time.sleep(2)
 
         except Exception as e:
@@ -585,11 +511,6 @@ def _run_queue(user_id: str, say):
 # ─────────────────────────────────────────
 
 def _restore_queues():
-    """
-    On startup, finds any users with pending queue
-    items and resumes their queue automatically.
-    Posts a Slack DM to notify the user.
-    """
     try:
         from database import supabase as _sb
         result = _sb.table("research_queue") \
@@ -615,11 +536,6 @@ def _restore_queues():
             if not pending:
                 continue
 
-            print(
-                f"▶️  [STARTUP] {uid} — "
-                f"{len(pending)} items pending"
-            )
-
             def notify_and_resume(user_id, count):
                 try:
                     dexter_client.chat_postMessage(
@@ -629,8 +545,7 @@ def _restore_queues():
                             f"Resuming research queue — "
                             f"*{count} item"
                             f"{'s' if count != 1 else ''} "
-                            f"remaining*.\n"
-                            f"Starting now..."
+                            f"remaining*.\nStarting now..."
                         )
                     )
 
@@ -664,18 +579,6 @@ def _restore_queues():
 
 @dexter_app.event("message")
 def handle_dexter_dm(event, say):
-    """
-    Central handler for all Dexter Slack DMs.
-
-    Routing order:
-    1. Ignore bot messages
-    2. DMs only
-    3. Commands (!prospects, !queue, !add, !research)
-    4. Bullet list → queue multiple instructions
-    5. Mid-elicitation / clarification reply
-    6. Research intent → single run
-    7. General chat
-    """
     if event.get("bot_id"):
         return
     if event.get("channel_type") != "im":
@@ -689,22 +592,43 @@ def handle_dexter_dm(event, say):
         f"'{text[:60]}{'...' if len(text) > 60 else ''}'"
     )
 
-    if is_in_elicitation(user_id):
-        print(f"   [ELICIT STATE] Active")
-
     # ── !prospects ────────────────────────
     if text.lower().startswith("!prospects"):
         cancel_elicitation(user_id)
-        parts  = text.lower().split()
-        status = parts[1] if len(parts) > 1 else None
+        parts   = text.lower().split()
+        status  = None
+        segment = None
+
+        # !prospects <status> OR !prospects <segment>
+        if len(parts) > 1:
+            known_statuses = [
+                "researched", "draft_ready", "approved",
+                "sent", "replied", "closed", "skipped"
+            ]
+            if parts[1] in known_statuses:
+                status = parts[1]
+            else:
+                segment = " ".join(parts[1:])
+
         prospects = get_prospects(
-            status=status, limit=20
+            status=status, limit=20, segment=segment
         )
-        title = (
-            f"📋 Prospects — {status}"
-            if status else "📋 Prospect Pipeline"
-        )
+        title = "📋 Prospect Pipeline"
+        if status:
+            title = f"📋 Prospects — {status}"
+        if segment:
+            title = f"📋 Prospects — {segment}"
+
         say(format_prospects_for_slack(prospects, title))
+        return
+
+    # ── !segments ─────────────────────────
+    if text.lower() in [
+        "!segments", "!segment", "!segs"
+    ]:
+        cancel_elicitation(user_id)
+        summary = get_segment_summary()
+        say(format_segment_summary_for_slack(summary))
         return
 
     # ── !resetrun ─────────────────────────
@@ -724,12 +648,10 @@ def handle_dexter_dm(event, say):
            and summary["failed"] == 0:
             say(
                 "📋 No queue active.\n\n"
-                "To queue multiple research tasks, "
-                "paste a bulleted list:\n"
+                "Paste a bulleted list to queue tasks:\n"
                 "```\n"
-                "• vegan restaurants in Berlin, 20\n"
+                "• vegan restaurants Berlin, 20\n"
                 "• plant based brands Netherlands, 15\n"
-                "• mock meat manufacturers Austria, 10\n"
                 "```"
             )
             return
@@ -763,7 +685,6 @@ def handle_dexter_dm(event, say):
             f"\n_*!queue clear* to cancel · "
             f"*!queue resume* to restart if paused_"
         )
-
         say("\n".join(lines))
         return
 
@@ -772,10 +693,7 @@ def handle_dexter_dm(event, say):
         "!queue clear", "!clearqueue"
     ]:
         clear_queue(user_id)
-        say(
-            "🗑️ Research queue cleared.\n"
-            "Paste a new bullet list to start again."
-        )
+        say("🗑️ Queue cleared.")
         return
 
     # ── !queue resume ─────────────────────
@@ -786,11 +704,9 @@ def handle_dexter_dm(event, say):
         if not pending:
             say("📋 No pending items in queue.")
             return
-
         if user_id in queue_running:
             say("⚠️ Queue is already running.")
             return
-
         say(
             f"▶️ Resuming queue — "
             f"*{len(pending)} item"
@@ -807,9 +723,6 @@ def handle_dexter_dm(event, say):
         if not business_query:
             say("⚠️ Example: *!add Monzo London UK*")
             return
-        print(
-            f"➕ [DEXTER CMD] !add: '{business_query}'"
-        )
         _run_research(
             user_id=user_id,
             instruction=business_query,
@@ -829,17 +742,11 @@ def handle_dexter_dm(event, say):
             )
             return
 
-        print(
-            f"🔬 [DEXTER CMD] !research: '{query}'"
-        )
-
         if _needs_elicitation(query):
-            print(f"   [ELICIT] Vague — asking")
             say(start_elicitation(user_id, query))
         else:
             ambiguity_q = _detect_ambiguity(query)
             if ambiguity_q:
-                print(f"   [CLARIFY] Ambiguity detected")
                 say(
                     start_clarification(
                         user_id=user_id,
@@ -850,7 +757,6 @@ def handle_dexter_dm(event, say):
                     )
                 )
             else:
-                print(f"   [DIRECT] Clear — researching")
                 _run_research(
                     user_id=user_id,
                     instruction=query,
@@ -859,29 +765,17 @@ def handle_dexter_dm(event, say):
         return
 
     # ── BULLET LIST → QUEUE ───────────────
-    # Must come BEFORE elicitation and intent detection
-    # so a bullet list doesn't trigger research intent
     if _is_bullet_list(text):
         cancel_elicitation(user_id)
         instructions = _parse_bullet_list(text)
 
         if not instructions:
-            say(
-                "⚠️ Couldn't parse any instructions "
-                "from that list."
-            )
+            say("⚠️ Couldn't parse that list.")
             return
-
-        print(
-            f"📋 [QUEUE] Parsed {len(instructions)} "
-            f"instructions from bullet list"
-        )
 
         saved = save_queue(user_id, instructions)
         if not saved:
-            say(
-                "❌ Failed to save queue. Try again."
-            )
+            say("❌ Failed to save queue. Try again.")
             return
 
         lines = [
@@ -891,9 +785,8 @@ def handle_dexter_dm(event, say):
         ]
         for i, inst in enumerate(instructions):
             lines.append(f"  {i + 1}. {inst}")
-
         lines.append(
-            f"\n_Type *!queue* to check progress · "
+            f"\n_*!queue* to check progress · "
             f"*!queue clear* to cancel_"
         )
         say("\n".join(lines))
@@ -901,19 +794,11 @@ def handle_dexter_dm(event, say):
         if user_id not in queue_running:
             _run_queue(user_id, say)
         else:
-            say(
-                "_A queue is already running. "
-                "New items added to the end._"
-            )
+            say("_Queue already running — items added._")
         return
 
     # ── MID-ELICITATION / CLARIFICATION ──
-    # Must come BEFORE research intent detection
     if is_in_elicitation(user_id):
-        print(
-            f"❓ [DEXTER] Elicitation reply: '{text}'"
-        )
-
         question, query, industry, location = \
             handle_elicitation_reply(user_id, text)
 
@@ -921,8 +806,7 @@ def handle_dexter_dm(event, say):
             say(question)
         elif query:
             say(
-                f"✅ Got it — searching for "
-                f"*{query}*..."
+                f"✅ Got it — searching for *{query}*..."
             )
             _run_research(
                 user_id=user_id,
@@ -943,7 +827,6 @@ def handle_dexter_dm(event, say):
         "clients", "leads", "prospects"
     ]
     if any(s in text.lower() for s in research_signals):
-        print(f"🔬 [DEXTER] Research intent")
         if _needs_elicitation(text):
             say(start_elicitation(user_id, text))
         else:
@@ -967,7 +850,6 @@ def handle_dexter_dm(event, say):
         return
 
     # ── GENERAL CHAT ─────────────────────
-    print(f"💬 [DEXTER] → chat")
     say("_Thinking..._")
     say(chat_with_dexter(user_id, text))
 
@@ -991,27 +873,35 @@ def start_outreach_run(
     user_id:  str,
     contacts: list[dict],
     say,
-    source:   str = "csv"
+    source:   str  = "csv",
+    segment:  str  = None
 ):
     print(
         f"🚀 [RILEY] Run ({source}) — "
         f"{len(contacts)} contacts"
+        f"{f\" segment='{segment}'\" if segment else ''}"
     )
     clear_run_state(user_id)
+    stop_requested.discard(user_id)
 
     mode_msg = (
         "⚡ *Auto-send ON*"
         if is_auto_mode(user_id)
-        else
-        "✋ *Approval mode ON* — "
+        else "✋ *Approval mode ON* — "
         "I'll show each draft first."
+    )
+
+    seg_note = (
+        f"\n📂 *Segment:* {segment}"
+        if segment else ""
     )
 
     say(
         f"✅ Starting outreach for "
-        f"*{len(contacts)} prospects*.\n\n"
+        f"*{len(contacts)} prospects*."
+        f"{seg_note}\n\n"
         f"{mode_msg}\n\n"
-        f"_Type *!automode on/off* to switch._"
+        f"_Type *STOP* at any time to pause the run._"
     )
 
     approval_state[user_id] = {
@@ -1019,6 +909,7 @@ def start_outreach_run(
         "remaining_contacts": list(contacts),
         "waiting":            False,
         "source":             source,
+        "segment":            segment,
         "stats": {
             "sent":    0,
             "skipped": 0,
@@ -1049,6 +940,31 @@ def post_draft_for_approval(
 def process_next_contact(user_id: str, say):
     def _run():
         if user_id not in approval_state:
+            return
+
+        # ── STOP CHECK ────────────────────
+        if user_id in stop_requested:
+            state = approval_state.get(user_id, {})
+            stats = state.get("stats", {})
+            total = (
+                stats.get("sent", 0) +
+                stats.get("skipped", 0) +
+                stats.get("failed", 0)
+            )
+            say(
+                f"⏹️ *Campaign stopped.*\n\n"
+                f"📊 Progress so far:\n"
+                f"• Sent: {stats.get('sent', 0)}\n"
+                f"• Skipped: {stats.get('skipped', 0)}\n"
+                f"• Failed: {stats.get('failed', 0)}\n\n"
+                f"_{len(state.get('remaining_contacts', []))} "
+                f"prospects not yet contacted._\n"
+                f"_Type *!run* to start a new run._"
+            )
+            stop_requested.discard(user_id)
+            clear_run_state(user_id)
+            if user_id in approval_state:
+                del approval_state[user_id]
             return
 
         state     = approval_state[user_id]
@@ -1250,7 +1166,6 @@ def handle_approval_reply(
 
     state["waiting"]        = False
     state["pending_result"] = None
-    print(f"🔓 [RILEY] waiting cleared")
 
     # ── APPROVE ──────────────────────────
     if text.lower().strip() == "approve":
@@ -1285,7 +1200,6 @@ def handle_approval_reply(
         return
 
     # ── REDRAFT WITH LEARNING ─────────────
-    print(f"✏️  [RILEY] Redraft: '{text[:80]}'")
     say("Got it — redrafting with your feedback...")
 
     from agents.riley import parse_draft
@@ -1300,11 +1214,6 @@ def handle_approval_reply(
         )
 
         new_subject, new_body = parse_draft(new_draft)
-
-        print(
-            f"✅ [RILEY] Redraft ready. "
-            f"Learned: '{learned}'"
-        )
 
         if learned:
             say(
@@ -1331,7 +1240,6 @@ def handle_approval_reply(
         )
         state["pending_result"] = result
         state["waiting"]        = True
-        print(f"🔒 [RILEY] Restored waiting")
 
 
 # ═══════════════════════════════════════════
@@ -1366,34 +1274,89 @@ def handle_riley_dm(event, say):
         handle_file_upload(event, say, user_id)
         return
 
-    # !run
+    # ── STOP — highest priority ───────────
+    # Checked before everything else so it
+    # works during approval waits too
+    if text.strip().upper() == "STOP":
+        if user_id in approval_state:
+            stop_requested.add(user_id)
+            state = approval_state[user_id]
+
+            if state.get("waiting"):
+                # Mid-approval — skip current draft
+                # then stop on next iteration
+                result  = state.get("pending_result")
+                if result:
+                    skip_contact(result)
+                state["pending_result"] = None
+                state["waiting"]        = False
+
+            say(
+                "⏹️ *Stopping campaign...*\n"
+                "_Finishing current action, "
+                "then halting. One moment._"
+            )
+        else:
+            say(
+                "ℹ️ No campaign currently running.\n"
+                "_Type *!run* to start one._"
+            )
+        return
+
+    # ── !run ─────────────────────────────
     if text.lower().startswith("!run"):
-        parts  = text.lower().split()
-        status = parts[1] if len(parts) > 1 \
-            else "researched"
+        # Parse: !run [status] [segment]
+        # Examples:
+        #   !run
+        #   !run draft_ready
+        #   !run berlin
+        #   !run researched berlin
+        parts   = text.split(None, 2)
+        status  = "researched"
+        segment = None
 
-        if status not in ["researched", "draft_ready"]:
-            say("⚠️ Use: *!run* or *!run draft_ready*")
-            return
+        known_statuses = [
+            "researched", "draft_ready", "approved",
+            "sent", "replied", "closed", "skipped"
+        ]
 
-        print(f"🚀 [RILEY CMD] !run status={status}")
+        if len(parts) >= 2:
+            if parts[1].lower() in known_statuses:
+                status = parts[1].lower()
+                if len(parts) >= 3:
+                    segment = parts[2].strip()
+            else:
+                # No status given — treat as segment
+                segment = " ".join(
+                    parts[1:]
+                ).strip()
+
+        print(
+            f"🚀 [RILEY CMD] !run "
+            f"status={status} segment={segment}"
+        )
 
         prospects = get_prospects_for_outreach(
-            status=status, limit=50
+            status=status,
+            limit=50,
+            segment=segment
         )
 
         print(
             f"📋 [RILEY] Fetched {len(prospects)} "
-            f"prospects with status='{status}'"
+            f"prospects"
         )
 
         if not prospects:
+            seg_hint = (
+                f" in segment *{segment}*"
+                if segment else ""
+            )
             say(
                 f"📋 No *{status.replace('_', ' ')}* "
-                f"prospects with emails found.\n\n"
-                f"• Ask Dexter to research businesses\n"
-                f"• Or type *!pipeline {status}* to "
-                f"see what's in the DB"
+                f"prospects{seg_hint} found.\n\n"
+                f"• *!segments* to see all segments\n"
+                f"• Ask Dexter to research businesses"
             )
             return
 
@@ -1404,11 +1367,6 @@ def handle_riley_dm(event, say):
         ]
         without_email = len(prospects) - len(with_email)
 
-        print(
-            f"📋 [RILEY] {len(with_email)} valid emails, "
-            f"{without_email} invalid"
-        )
-
         if not with_email:
             say(
                 f"⚠️ Found *{len(prospects)} prospects* "
@@ -1418,13 +1376,13 @@ def handle_riley_dm(event, say):
             return
 
         msg = (
-            f"✅ Found *{len(with_email)} prospects* "
-            f"with emails."
+            f"✅ Found *{len(with_email)} prospects*"
+            f"{f' in *{segment}*' if segment else ''}."
         )
         if without_email > 0:
             msg += (
                 f"\n⚠️ {without_email} will be skipped "
-                f"(invalid email format)."
+                f"(invalid email)."
             )
         msg += "\nStarting drafting now..."
         say(msg)
@@ -1433,11 +1391,12 @@ def handle_riley_dm(event, say):
             user_id=user_id,
             contacts=with_email,
             say=say,
-            source="db"
+            source="db",
+            segment=segment
         )
         return
 
-    # !pipeline
+    # ── !pipeline ────────────────────────
     if text.lower().startswith("!pipeline"):
         parts  = text.lower().split()
         status = parts[1] if len(parts) > 1 else None
@@ -1458,7 +1417,43 @@ def handle_riley_dm(event, say):
             )
         return
 
-    # !mark
+    # ── !segments ─────────────────────────
+    if text.lower() in [
+        "!segments", "!segment", "!segs"
+    ]:
+        summary = get_segment_summary()
+        say(format_segment_summary_for_slack(summary))
+        return
+
+    # ── !prospects ────────────────────────
+    if text.lower().startswith("!prospects"):
+        parts   = text.lower().split()
+        status  = None
+        segment = None
+
+        if len(parts) > 1:
+            known_statuses = [
+                "researched", "draft_ready", "approved",
+                "sent", "replied", "closed", "skipped"
+            ]
+            if parts[1] in known_statuses:
+                status = parts[1]
+            else:
+                segment = " ".join(parts[1:])
+
+        prospects = get_prospects(
+            status=status, limit=30, segment=segment
+        )
+        title = "📋 Prospect Pipeline"
+        if status:
+            title = f"📋 Prospects — {status}"
+        if segment:
+            title = f"📋 Prospects — {segment}"
+
+        say(format_prospects_for_slack(prospects, title))
+        return
+
+    # ── !mark ────────────────────────────
     if text.lower().startswith("!mark "):
         parts = text.split(" ", 2)
         if len(parts) < 3:
@@ -1495,7 +1490,8 @@ def handle_riley_dm(event, say):
         )
         return
 
-    # Other commands
+    # ── OTHER COMMANDS ────────────────────
+
     if text.lower() == "!reset":
         clear_history("riley", user_id)
         say("🔄 Memory cleared.")
@@ -1547,18 +1543,19 @@ def handle_riley_dm(event, say):
 
     if text.lower() == "!resetrun":
         clear_run_state(user_id)
+        stop_requested.discard(user_id)
         if user_id in approval_state:
             del approval_state[user_id]
         say("🗑️ Run cancelled.")
         return
 
-    # Approval reply
+    # ── APPROVAL REPLY ───────────────────
     if user_id in approval_state and \
        approval_state[user_id].get("waiting"):
         handle_approval_reply(user_id, text, say)
         return
 
-    # Pasted table
+    # ── PASTED TABLE ─────────────────────
     if (
         "\n" in text and
         "@" in text and
@@ -1585,8 +1582,7 @@ def handle_riley_dm(event, say):
             )
             return
 
-    # General chat
-    print(f"💬 [RILEY ROUTING] → chat")
+    # ── GENERAL CHAT ─────────────────────
     say("_Thinking..._")
     say(chat_with_riley(user_id, text))
 
@@ -1619,6 +1615,7 @@ def restore_interrupted_runs():
             "remaining_contacts": list(remaining),
             "waiting":            False,
             "source":             "db",
+            "segment":            None,
             "stats":              stats
         }
 

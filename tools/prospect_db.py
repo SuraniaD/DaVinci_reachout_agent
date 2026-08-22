@@ -3,9 +3,34 @@ from interaction_log import log_action
 from datetime import datetime, timezone
 
 
+def _derive_segment(source_query: str) -> str:
+    """
+    Derives a clean segment label from source_query.
+    Strips number prefixes and trailing count hints.
+    e.g. "vegan restaurants Berlin, 20" → "vegan restaurants Berlin"
+    """
+    if not source_query:
+        return "uncategorised"
+
+    import re
+    segment = source_query.strip()
+    # Strip leading numbers e.g. "20 vegan..."
+    segment = re.sub(r'^\d+\s+', '', segment)
+    # Strip trailing ", 20" or "list of 20" etc
+    segment = re.sub(
+        r',?\s*(list\s+of\s+)?\d+\s*$', '', segment
+    )
+    segment = re.sub(
+        r'\s+', ' ', segment
+    ).strip().lower()
+
+    return segment or "uncategorised"
+
+
 def add_prospect(prospect: dict) -> dict | None:
     """
     Writes one prospect to the prospects table.
+    Derives segment from source_query.
     Validates required fields before inserting.
     Checks for duplicates by business_name first.
     """
@@ -53,6 +78,9 @@ def add_prospect(prospect: dict) -> dict | None:
             )
             return None
 
+        source_query = prospect.get("source_query") or ""
+        segment      = _derive_segment(source_query)
+
         row = {
             "business_name":    business_name,
             "contact_name":     prospect.get("contact_name") or None,
@@ -61,7 +89,8 @@ def add_prospect(prospect: dict) -> dict | None:
             "location":         prospect.get("location") or None,
             "industry":         prospect.get("industry") or None,
             "research_summary": prospect.get("research_summary") or None,
-            "source_query":     prospect.get("source_query") or None,
+            "source_query":     source_query or None,
+            "segment":          segment,
             "outreach_status":  "researched"
         }
 
@@ -75,13 +104,14 @@ def add_prospect(prospect: dict) -> dict | None:
                 f"✅ [PROSPECT DB] Added: "
                 f"'{business_name}' "
                 f"(ID: {inserted['id']}) "
+                f"segment: '{segment}' "
                 f"email: {row.get('email', 'none')}"
             )
             log_action(
                 action_type="prospect_added",
                 business_name=business_name,
                 detail=(
-                    f"Added by Dexter — "
+                    f"segment: {segment} — "
                     f"email: "
                     f"{prospect.get('email') or 'unknown'}"
                 )
@@ -97,20 +127,19 @@ def add_prospect(prospect: dict) -> dict | None:
 
 
 def get_prospects_for_outreach(
-    status: str = "researched",
-    limit:  int = 50
+    status:  str = "researched",
+    limit:   int = 50,
+    segment: str = None
 ) -> list[dict]:
     """
-    Fetches prospects ready for Riley to work on.
+    Fetches prospects ready for Riley.
     Filters at DB level:
-    - must have a valid email
-    - must have a research_summary (min content)
-    Prospects without both are not ready for outreach.
-    Sorts newest first so audit-gated prospects
-    come through before old no-email ones.
+    - must have valid email
+    - must have research_summary
+    Optional segment filter for targeted campaigns.
     """
     try:
-        result = supabase.table("prospects") \
+        query = supabase.table("prospects") \
             .select("*") \
             .eq("outreach_status", status) \
             .not_.is_("email", "null") \
@@ -121,24 +150,21 @@ def get_prospects_for_outreach(
             .not_.is_("research_summary", "null") \
             .neq("research_summary", "") \
             .order("created_at", desc=True) \
-            .limit(limit) \
-            .execute()
+            .limit(limit)
 
-        rows = result.data
+        if segment:
+            query = query.ilike(
+                "segment", f"%{segment}%"
+            )
+
+        result = query.execute()
+        rows   = result.data
+
         print(
             f"✅ [PROSPECT DB] Fetched "
             f"{len(rows)} prospects "
-            f"with status='{status}' "
-            f"(email + summary present)"
-        )
-
-        with_email = sum(
-            1 for r in rows if r.get("email")
-        )
-        without_email = len(rows) - with_email
-        print(
-            f"📧 [PROSPECT DB] {with_email} with email, "
-            f"{without_email} without"
+            f"status='{status}'"
+            f"{f\" segment~'{segment}'\" if segment else ''}"
         )
 
         return rows
@@ -151,19 +177,19 @@ def get_prospects_for_outreach(
 
 
 def get_prospects(
-    status: str = None,
-    limit:  int = 20
+    status:  str = None,
+    limit:   int = 20,
+    segment: str = None
 ) -> list[dict]:
     """
     Fetches prospects for pipeline display.
-    Optional status filter. No email filter here
-    so pipeline shows full picture including gaps.
+    Optional status and segment filters.
     """
     try:
         query = supabase.table("prospects") \
             .select(
                 "id, business_name, contact_name, "
-                "email, location, industry, "
+                "email, location, industry, segment, "
                 "outreach_status, created_at"
             ) \
             .order("created_at", desc=True) \
@@ -171,6 +197,11 @@ def get_prospects(
 
         if status:
             query = query.eq("outreach_status", status)
+
+        if segment:
+            query = query.ilike(
+                "segment", f"%{segment}%"
+            )
 
         result = query.execute()
         return result.data
@@ -180,13 +211,68 @@ def get_prospects(
         return []
 
 
+def get_segment_summary() -> dict:
+    """
+    Returns prospect counts grouped by segment
+    and outreach_status.
+
+    Returns:
+    {
+        "vegan restaurants berlin": {
+            "researched": 8,
+            "sent": 3,
+            "replied": 1,
+            "total": 12
+        },
+        ...
+    }
+    """
+    try:
+        result = supabase.table("prospects") \
+            .select("segment, outreach_status") \
+            .execute()
+
+        summary = {}
+        for row in result.data:
+            seg    = row.get("segment") or "uncategorised"
+            status = row.get("outreach_status", "unknown")
+
+            if seg not in summary:
+                summary[seg] = {"total": 0}
+
+            summary[seg]["total"] = \
+                summary[seg].get("total", 0) + 1
+            summary[seg][status] = \
+                summary[seg].get(status, 0) + 1
+
+        # Sort by total descending
+        summary = dict(
+            sorted(
+                summary.items(),
+                key=lambda x: x[1].get("total", 0),
+                reverse=True
+            )
+        )
+
+        return summary
+
+    except Exception as e:
+        print(
+            f"❌ [PROSPECT DB] Segment summary "
+            f"failed: {e}"
+        )
+        return {}
+
+
 def get_prospect_by_name(
     business_name: str
 ) -> dict | None:
     try:
         result = supabase.table("prospects") \
             .select("*") \
-            .ilike("business_name", f"%{business_name}%") \
+            .ilike(
+                "business_name", f"%{business_name}%"
+            ) \
             .limit(1) \
             .execute()
 
@@ -229,10 +315,6 @@ def save_draft(
     version:     int = 1,
     status:      str = "pending"
 ) -> dict | None:
-    """
-    Saves an email draft to email_drafts table.
-    Creates a new row for every draft version.
-    """
     try:
         result = supabase.table("email_drafts") \
             .insert({
@@ -261,15 +343,11 @@ def save_draft(
 
 
 def update_draft_status(
-    draft_id:    int,
-    status:      str,
-    feedback:    str = None,
-    sent_at:     str = None
+    draft_id: int,
+    status:   str,
+    feedback: str = None,
+    sent_at:  str = None
 ):
-    """
-    Updates an email draft's status.
-    status: pending → approved → sent / rejected
-    """
     try:
         update_data = {"status": status}
         if feedback:
@@ -296,7 +374,6 @@ def update_draft_status(
 def get_latest_draft(
     prospect_id: int
 ) -> dict | None:
-    """Gets the most recent draft for a prospect."""
     try:
         result = supabase.table("email_drafts") \
             .select("*") \
@@ -332,7 +409,8 @@ def get_pipeline_summary() -> dict:
 
     except Exception as e:
         print(
-            f"❌ [PROSPECT DB] Pipeline count failed: {e}"
+            f"❌ [PROSPECT DB] Pipeline count "
+            f"failed: {e}"
         )
         return {}
 
@@ -361,7 +439,8 @@ def start_research_session(
 
     except Exception as e:
         print(
-            f"❌ [PROSPECT DB] Session start failed: {e}"
+            f"❌ [PROSPECT DB] Session start "
+            f"failed: {e}"
         )
         return None
 
@@ -387,7 +466,8 @@ def complete_research_session(
 
     except Exception as e:
         print(
-            f"❌ [PROSPECT DB] Session update failed: {e}"
+            f"❌ [PROSPECT DB] Session update "
+            f"failed: {e}"
         )
 
 
@@ -414,21 +494,87 @@ def format_prospects_for_slack(
     lines = [f"*{title}* ({len(prospects)} total)\n"]
 
     for p in prospects:
-        icon   = status_icons.get(
+        icon    = status_icons.get(
             p["outreach_status"], "•"
         )
-        name   = p["business_name"]
-        loc    = p.get("location") or ""
-        status = p["outreach_status"].replace("_", " ")
-        email  = p.get("email") or "no email"
+        name    = p["business_name"]
+        loc     = p.get("location") or ""
+        status  = p["outreach_status"].replace("_", " ")
+        email   = p.get("email") or "no email"
+        segment = p.get("segment") or ""
 
         line = f"{icon} *{name}*"
         if loc:
             line += f" — {loc}"
         line += f"\n   _{status}_ · {email}"
+        if segment:
+            line += f"\n   📂 {segment}"
         lines.append(line)
 
     return "\n\n".join(lines)
+
+
+def format_segment_summary_for_slack(
+    summary: dict
+) -> str:
+    """
+    Formats segment summary for Slack display.
+    Shows each segment with counts per status.
+    """
+    if not summary:
+        return (
+            "📊 No segments yet.\n"
+            "Ask Dexter to research some businesses."
+        )
+
+    status_icons = {
+        "researched":  "🔬",
+        "draft_ready": "✍️",
+        "approved":    "✅",
+        "sent":        "📧",
+        "replied":     "💬",
+        "closed":      "🏁",
+        "skipped":     "⏭️"
+    }
+
+    status_order = [
+        "researched", "draft_ready", "approved",
+        "sent", "replied", "closed", "skipped"
+    ]
+
+    total_all = sum(
+        v.get("total", 0) for v in summary.values()
+    )
+    lines = [
+        f"*📂 Segments* ({total_all} total prospects)\n"
+    ]
+
+    for seg, counts in summary.items():
+        total = counts.get("total", 0)
+        lines.append(f"*{seg}* — {total} prospects")
+
+        status_parts = []
+        for s in status_order:
+            if s in counts and s != "total":
+                icon = status_icons.get(s, "•")
+                status_parts.append(
+                    f"{icon} {s.replace('_', ' ')}: "
+                    f"{counts[s]}"
+                )
+
+        if status_parts:
+            lines.append(
+                "   " + " · ".join(status_parts)
+            )
+
+        lines.append("")
+
+    lines.append(
+        "_Use *!run <segment>* to target a segment_\n"
+        "_e.g.* !run berlin* · *!run netherlands*_"
+    )
+
+    return "\n".join(lines)
 
 
 def format_pipeline_summary_for_slack(
@@ -451,7 +597,9 @@ def format_pipeline_summary_for_slack(
     }
 
     total = sum(counts.values())
-    lines = [f"*📊 Pipeline Summary* ({total} total)\n"]
+    lines = [
+        f"*📊 Pipeline Summary* ({total} total)\n"
+    ]
 
     order = [
         "researched", "draft_ready", "approved",
@@ -466,8 +614,8 @@ def format_pipeline_summary_for_slack(
             lines.append(f"{icon} *{label}:* {count}")
 
     lines.append(
-        f"\n_Type *!pipeline <status>* to see details_\n"
-        f"_e.g. !pipeline researched · !pipeline sent_"
+        f"\n_*!segments* to see by segment_\n"
+        f"_*!pipeline <status>* to filter by status_"
     )
 
     return "\n".join(lines)
