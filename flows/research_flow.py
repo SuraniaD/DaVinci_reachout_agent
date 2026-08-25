@@ -52,39 +52,83 @@ def parse_query(raw_query: str) -> dict:
     Parses natural language research request into:
     { industry, location, target_size }
     Uses Groq FAST_MODEL.
+
+    Strips command words (research, find, get me, etc.)
+    before passing to the model so they don't pollute
+    the industry field.
     """
-    prompt = f"""Extract structured info from this research request:
+    # Pre-clean: strip leading command words
+    clean = re.sub(
+        r'^\s*(research|find|get me|look for|search for|'
+        r'i need|can you find|add|!research|!add)\s+',
+        '', raw_query.strip(), flags=re.IGNORECASE
+    ).strip()
 
-"{raw_query}"
+    prompt = f"""You extract structured search parameters
+from a business research request.
 
-Reply with JSON only — no explanation, no markdown:
+Request: "{clean}"
+
+Reply with JSON only — no explanation, no markdown, no extra text:
 {{
-  "industry": "<specific business type>",
-  "location": "<country/city/region or 'worldwide'>",
-  "target_size": <integer, default 10 if unspecified>
+  "industry": "<the type of business to search for>",
+  "location": "<country, city, or region — e.g. Netherlands, Tokyo, UK>",
+  "target_size": <how many businesses to find, integer, default 10>
 }}
 
+Rules:
+- "industry" = what kind of business (e.g. "vegan cafes", "plant-based food brands", "eco leather manufacturers")
+- "location" = WHERE to search — extract from the request. Never use "worldwide" if a location is mentioned.
+- Strip command words like "research", "find", "get me" — they are not the industry
+- If no number mentioned, default target_size to 10
+
 Examples:
-  "vegan leather UK, 200" → {{"industry": "vegan leather brands", "location": "United Kingdom", "target_size": 200}}
-  "plant based food Japan" → {{"industry": "plant-based food businesses", "location": "Japan", "target_size": 10}}
+  "vegan cafes in Netherlands, 50"
+  → {{"industry": "vegan cafes", "location": "Netherlands", "target_size": 50}}
+
+  "research plant based food Japan, 30"
+  → {{"industry": "plant-based food businesses", "location": "Japan", "target_size": 30}}
+
+  "find 200 mock meat brands in Germany"
+  → {{"industry": "mock meat brands", "location": "Germany", "target_size": 200}}
+
+  "eco leather companies UK"
+  → {{"industry": "eco leather companies", "location": "United Kingdom", "target_size": 10}}
+
+  "vegan restaurants Amsterdam 20"
+  → {{"industry": "vegan restaurants", "location": "Amsterdam, Netherlands", "target_size": 20}}
 """
 
     for attempt in range(2):
         try:
             response = _groq().chat.completions.create(
                 model=FAST_MODEL,
-                max_tokens=150,
-                temperature=0.1,
+                max_tokens=200,
+                temperature=0.0,
                 messages=[{"role": "user", "content": prompt}]
             )
             raw  = response.choices[0].message.content.strip()
             raw  = raw.replace("```json", "").replace("```", "").strip()
+
+            # Extract JSON if wrapped in extra text
+            match = re.search(r'\{.*\}', raw, re.DOTALL)
+            if match:
+                raw = match.group(0)
+
             data = json.loads(raw)
 
-            industry    = data.get("industry", "businesses")
-            location    = data.get("location", "worldwide")
-            target_size = int(data.get("target_size", 10))
+            industry    = (data.get("industry") or "businesses").strip()
+            location    = (data.get("location") or "worldwide").strip()
+            target_size = int(data.get("target_size") or 10)
             target_size = max(1, min(target_size, 500))
+
+            # Sanity check — if industry still contains
+            # the location or looks wrong, log it
+            if location.lower() in industry.lower() and                location.lower() != "worldwide":
+                industry = re.sub(
+                    re.escape(location), '',
+                    industry, flags=re.IGNORECASE
+                ).strip().strip(',').strip()
 
             print(
                 f"🔎 [QUERY PARSER] "
@@ -102,18 +146,41 @@ Examples:
             if "rate_limit" in str(e).lower() and attempt == 0:
                 time.sleep(60)
                 continue
-            print(f"❌ [QUERY PARSER] Error: {e}")
+            print(f"❌ [QUERY PARSER] Error: {e} | raw: {raw[:100] if 'raw' in dir() else 'n/a'}")
             break
 
-    # Fallback
-    number_match = re.search(r'\b(\d+)\b', raw_query)
+    # Fallback — regex-based extraction
+    # Strip command words
+    clean_fb = re.sub(
+        r'^(research|find|get me|look for|search for|'
+        r'i need|can you find)\s+',
+        '', raw_query.strip(), flags=re.IGNORECASE
+    )
+    number_match = re.search(r'\b(\d+)\b', clean_fb)
     target       = int(number_match.group(1)) if number_match else 10
+    # Try to extract location from common patterns
+    loc_match = re.search(
+        r'\bin\s+([A-Z][a-zA-Z\s]+?)(?:,|$)', clean_fb
+    )
+    location_fb = loc_match.group(1).strip() if loc_match else "worldwide"
+    # Industry = everything before the location or number
+    industry_fb = re.sub(
+        r'\s*,?\s*\d+.*$', '', clean_fb
+    ).strip()
+    industry_fb = re.sub(
+        r'\s+in\s+.*$', '', industry_fb,
+        flags=re.IGNORECASE
+    ).strip() or "businesses"
+
+    print(
+        f"⚠️  [QUERY PARSER] Fallback: "
+        f"industry='{industry_fb}' location='{location_fb}'"
+    )
     return {
-        "industry":    raw_query,
-        "location":    "worldwide",
+        "industry":    industry_fb,
+        "location":    location_fb,
         "target_size": min(target, 500)
     }
-
 
 # ─────────────────────────────────────────
 # RESEARCH WITH KEYWORDS
