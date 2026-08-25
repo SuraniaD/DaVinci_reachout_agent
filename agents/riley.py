@@ -1,3 +1,11 @@
+"""
+Riley — Outreach Agent
+Phase B orchestration via Slack DM.
+
+Email drafting now includes verification gate
+(x1 × x2 ≥ 0.81) before any send.
+"""
+
 import os
 import re
 import time
@@ -19,29 +27,31 @@ You are Riley, Outreach Manager at DaVinci AI.
 DaVinci AI automates business workflows using AI agents.
 You speak directly with the CEO over Slack DM.
 
+Every email you draft is verified before sending:
+x1 = accuracy vs stored research (target ≥ 0.9)
+x2 = accuracy vs fresh online info (target ≥ 0.9)
+combined = x1 × x2 (must reach 0.81 to send)
+
 BEHAVIOUR:
 - Short and direct — this is Slack, not email
 - Ask one question when instructions are vague
 - Have opinions and share them
-- Summarise clearly when asked what you have done
-- Say clearly if something went wrong and suggest a fix
-
-WHEN THE CEO GIVES FEEDBACK ON AN EMAIL DRAFT:
-- Always acknowledge what you will change
-- Confirm you have saved it as a preference for future drafts
 
 COMMANDS:
-- !reset            → confirm memory cleared
-- !status           → summarise recent outreach activity
-- !automode on/off  → toggle auto-send mode
-- !showprefs        → list all saved preferences
-- !resetprefs       → clear all saved preferences
-- !resetrun         → cancel current outreach run
-- !run              → start outreach from DB prospects
-- !run <segment>    → run outreach for one segment only
-- !pipeline         → show prospect pipeline summary
-- !segments         → show all segments with stats
-- STOP              → stop current campaign after this draft
+- !run <region>       → start verified outreach
+- !run <region> draft_ready → retry skipped
+- !pipeline           → pipeline summary
+- !segments           → geographic breakdown
+- !analytics          → campaign stats (30 days)
+- !review             → human review queue
+- !approve-review <n> → send draft as-is
+- !redraft-review <n> → redraft + re-verify
+- !discard-review <n> → skip and move on
+- !automode on/off    → toggle auto-send
+- !showprefs          → list writing preferences
+- !resetprefs         → clear preferences
+- !resetrun           → cancel current run
+- STOP                → pause current campaign
 """
 
 DAILY_TOKEN_LIMIT   = 500_000
@@ -74,139 +84,92 @@ FEEDBACK_TRIGGERS = [
 
 
 def _looks_like_feedback(text: str) -> bool:
-    text_lower = text.lower()
-    return any(t in text_lower for t in FEEDBACK_TRIGGERS)
+    return any(t in text.lower() for t in FEEDBACK_TRIGGERS)
 
 
 def _extract_preference(
-    user_id:  str,
-    feedback: str
+    user_id: str, feedback: str
 ) -> str | None:
     prompt = f"""
-The CEO gave this feedback on an outreach email draft:
+The CEO gave feedback on an outreach email:
 "{feedback}"
 
-If this contains a reusable writing rule for ALL future
-emails, extract it as one clear sentence.
-If not reusable reply: NOT_A_PREFERENCE
+If this is a reusable writing rule for ALL future emails,
+extract it as one clear sentence.
+If not reusable: NOT_A_PREFERENCE
 
 Reply ONLY with the rule or NOT_A_PREFERENCE.
-Examples:
-  Input: "make it shorter, 3 sentences max"
-  Output: Keep email body to 3 sentences maximum.
-
-  Input: "don't use bullet points"
-  Output: Never use bullet points in email body.
-
-  Input: "approve"
-  Output: NOT_A_PREFERENCE
-
-  Input: "the opening is too generic"
-  Output: Always open with a specific detail about
-  the prospect's business.
 """
     try:
         response = client.chat.completions.create(
             model=CHAT_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=80,
-            temperature=0.1
+            max_tokens=80, temperature=0.1
         )
         result = response.choices[0].message.content.strip()
-        if result == "NOT_A_PREFERENCE" or not result:
-            return None
-        return result
-
+        return None if result == "NOT_A_PREFERENCE" else result
     except Exception as e:
-        print(f"⚠️  [PREFERENCES] Extraction failed: {e}")
+        print(f"⚠️  [PREFERENCES] Extraction: {e}")
         return None
 
 
 def _call_groq_with_retry(
-    messages:    list,
-    max_tokens:  int,
-    temperature: float
+    messages: list, max_tokens: int, temperature: float
 ) -> tuple[str, int]:
     for attempt in range(2):
         try:
             response = client.chat.completions.create(
-                model=CHAT_MODEL,
-                messages=messages,
+                model=CHAT_MODEL, messages=messages,
                 max_tokens=max_tokens,
                 temperature=temperature
             )
-            content     = response.choices[0].message.content
-            tokens_used = response.usage.total_tokens
-            print(f"🔢 [TOKENS] {tokens_used} tokens")
-            return content, tokens_used
-
+            return (
+                response.choices[0].message.content,
+                response.usage.total_tokens
+            )
         except Exception as e:
-            if "rate_limit_exceeded" in str(e) \
-               and attempt == 0:
-                print("⏳ Rate limit — waiting 60s...")
+            if "rate_limit" in str(e) and attempt == 0:
                 time.sleep(60)
                 continue
             raise e
 
 
-def _token_footer(tokens_this_call: int) -> str:
+def _token_footer(tokens: int) -> str:
     global session_tokens_used
-    session_tokens_used += tokens_this_call
+    session_tokens_used += tokens
 
-    pct_used      = min(
-        (session_tokens_used / DAILY_TOKEN_LIMIT) * 100,
-        100
-    )
-    pct_remaining = max(100 - pct_used, 0)
-
-    if pct_remaining > 20:
-        indicator = "🟢"
-    elif pct_remaining > 6:
-        indicator = "🟡"
-    else:
-        indicator = "🔴"
-
-    filled = int(pct_used / 10)
-    bar    = "█" * filled + "░" * (10 - filled)
+    pct = min(session_tokens_used / DAILY_TOKEN_LIMIT * 100, 100)
+    rem = max(100 - pct, 0)
+    ind = "🟢" if rem > 20 else "🟡" if rem > 6 else "🔴"
+    bar = "█" * int(pct / 10) + "░" * (10 - int(pct / 10))
 
     return (
         f"\n\n─────────────────────\n"
-        f"{indicator} `{bar}` "
-        f"{pct_used:.1f}% used · "
-        f"{pct_remaining:.1f}% remaining today"
+        f"{ind} `{bar}` "
+        f"{pct:.1f}% used · {rem:.1f}% remaining today"
     )
 
 
 def _load_skill(filename: str) -> str:
     paths = [
-        os.path.join(
-            os.path.dirname(__file__), "..", filename
-        ),
+        os.path.join(os.path.dirname(__file__), "..", filename),
         os.path.join(os.getcwd(), filename)
     ]
-
     for path in paths:
         if os.path.exists(path):
             try:
-                with open(path, "r") as f:
-                    content = f.read()
-                print(f"✅ Skill loaded: {filename}")
-                return content
+                with open(path) as f:
+                    return f.read()
             except Exception as e:
                 print(f"⚠️  Could not read {path}: {e}")
 
-    print(
-        f"❌ {filename} not found — using fallback\n"
-        f"   CWD: {os.getcwd()}"
-    )
-
     return f"""
-You are Riley at DaVinci AI.
-Write a short cold outreach email (2 paragraphs, max 100 words).
-Paragraph 1: specific hook about the prospect's business.
-Paragraph 2: what DaVinci AI does and why it's relevant.
+Draft a cold outreach email for DaVinci AI.
+2 paragraphs. Max 100 words.
+Paragraph 1: specific hook about the business.
+Paragraph 2: what DaVinci AI does and why relevant.
 
-Output format — follow exactly:
+Format exactly:
 SUBJECT: <subject line>
 
 BODY:
@@ -216,62 +179,59 @@ BODY:
 """
 
 
-def chat_with_riley(
-    user_id:      str,
-    user_message: str
-) -> str:
+# ─────────────────────────────────────────
+# GENERAL CHAT
+# ─────────────────────────────────────────
+
+def chat_with_riley(user_id: str, user_message: str) -> str:
     history = get_history("riley", user_id)
     add_message("riley", user_id, "user", user_message)
 
-    messages = history + [
-        {"role": "user", "content": user_message}
-    ]
-
     try:
-        reply, tokens_used = _call_groq_with_retry(
+        reply, tokens = _call_groq_with_retry(
             messages=[
-                {
-                    "role":    "system",
-                    "content": RILEY_SYSTEM_PROMPT
-                }
-            ] + messages,
+                {"role": "system", "content": RILEY_SYSTEM_PROMPT}
+            ] + history + [
+                {"role": "user", "content": user_message}
+            ],
             max_tokens=500,
             temperature=0.7
         )
 
         if _looks_like_feedback(user_message):
-            preference = _extract_preference(
-                user_id, user_message
-            )
-            if preference:
+            pref = _extract_preference(user_id, user_message)
+            if pref:
                 from tools.preferences import save_preference
-                save_preference(user_id, preference)
-                print(f"🧠 [LEARN] Chat: '{preference}'")
+                save_preference(user_id, pref)
+                print(f"🧠 [LEARN] Chat: '{pref}'")
 
         add_message("riley", user_id, "assistant", reply)
-        return reply + _token_footer(tokens_used)
+        return reply + _token_footer(tokens)
 
     except Exception as e:
         print(f"❌ Groq chat error: {e}")
         return f"Sorry, hit an error: {e}."
 
 
+# ─────────────────────────────────────────
+# DRAFT EMAIL
+# ─────────────────────────────────────────
+
 def draft_outreach_email(
-    user_id:       str,
-    contact_name:  str,
-    business_name: str,
-    research:      str
+    user_id: str, contact_name: str,
+    business_name: str, research: str
 ) -> str:
+    """
+    Drafts a personalised outreach email.
+    Does NOT verify — verification happens in
+    flows/reachout_flow.py after drafting.
+    """
     email_skill = _load_skill("email_template.txt")
 
     from tools.preferences import build_preferences_block
-    prefs_block = build_preferences_block(user_id)
-
-    if prefs_block:
-        email_skill = prefs_block + "\n\n" + email_skill
-        print(f"🧠 [DRAFT] Preferences injected")
-    else:
-        print("🧠 [DRAFT] No preferences saved yet")
+    prefs = build_preferences_block(user_id)
+    if prefs:
+        email_skill = prefs + "\n\n" + email_skill
 
     task = f"""Contact name:  {contact_name}
 Business name: {business_name}
@@ -290,7 +250,7 @@ Start with SUBJECT: on the first line."""
     )
 
     try:
-        draft, tokens_used = _call_groq_with_retry(
+        draft, tokens = _call_groq_with_retry(
             messages=[
                 {"role": "system", "content": email_skill},
                 {"role": "user",   "content": task}
@@ -300,16 +260,8 @@ Start with SUBJECT: on the first line."""
         )
 
         global session_tokens_used
-        session_tokens_used += tokens_used
+        session_tokens_used += tokens
 
-        pct = (
-            session_tokens_used / DAILY_TOKEN_LIMIT
-        ) * 100
-        print(
-            f"✍️  [DRAFT] {contact_name} @ "
-            f"{business_name} — "
-            f"{tokens_used} tokens · {pct:.1f}% used"
-        )
         print(
             f"📝 [DRAFT RAW] '{business_name}':\n"
             f"{'─'*40}\n{draft}\n{'─'*40}"
@@ -323,44 +275,45 @@ Start with SUBJECT: on the first line."""
         raise Exception(f"Could not draft email: {e}")
 
 
+# ─────────────────────────────────────────
+# DRAFT WITH FEEDBACK (redraft)
+# ─────────────────────────────────────────
+
 def draft_with_feedback(
-    user_id:        str,
-    feedback:       str,
-    original_draft: str,
-    contact_name:   str,
-    business_name:  str
+    user_id: str, feedback: str,
+    original_draft: str, contact_name: str,
+    business_name: str
 ) -> tuple[str, str | None]:
+    """
+    Redrafts incorporating CEO feedback or
+    verification failure feedback.
+    Saves preference first if feedback is CEO input.
+    """
     learned = None
     if _looks_like_feedback(feedback):
-        preference = _extract_preference(
-            user_id, feedback
-        )
-        if preference:
+        pref = _extract_preference(user_id, feedback)
+        if pref:
             from tools.preferences import save_preference
-            save_preference(user_id, preference)
-            learned = preference
-            print(
-                f"🧠 [LEARN] From redraft: '{preference}'"
-            )
+            save_preference(user_id, pref)
+            learned = pref
 
     email_skill = _load_skill("email_template.txt")
     from tools.preferences import build_preferences_block
-    prefs_block = build_preferences_block(user_id)
-    if prefs_block:
-        email_skill = prefs_block + "\n\n" + email_skill
+    prefs = build_preferences_block(user_id)
+    if prefs:
+        email_skill = prefs + "\n\n" + email_skill
 
-    task = f"""CEO feedback on this draft: "{feedback}"
+    task = f"""Feedback on this draft: "{feedback}"
 
 Original draft:
 {original_draft}
 
-Rewrite the email applying this feedback exactly.
-Follow the output format — start with SUBJECT: on the
-first line, then a blank line, then BODY: on its own line,
-then the email body in two paragraphs."""
+Rewrite applying this feedback exactly.
+SUBJECT: on first line, then BODY: on its own line,
+then two paragraphs."""
 
     try:
-        new_draft, tokens_used = _call_groq_with_retry(
+        new_draft, tokens = _call_groq_with_retry(
             messages=[
                 {"role": "system", "content": email_skill},
                 {"role": "user",   "content": task}
@@ -370,11 +323,9 @@ then the email body in two paragraphs."""
         )
 
         global session_tokens_used
-        session_tokens_used += tokens_used
+        session_tokens_used += tokens
 
-        add_message(
-            "riley", user_id, "assistant", new_draft
-        )
+        add_message("riley", user_id, "assistant", new_draft)
         return new_draft, learned
 
     except Exception as e:
@@ -382,27 +333,24 @@ then the email body in two paragraphs."""
         raise Exception(f"Could not redraft: {e}")
 
 
+# ─────────────────────────────────────────
+# PARSE DRAFT
+# ─────────────────────────────────────────
+
 def parse_draft(draft: str) -> tuple[str, str]:
     """
-    Splits raw draft into subject and body.
-
-    Three-level fallback:
-    1. SUBJECT: + BODY: markers (standard)
-    2. SUBJECT: found but no BODY: — use remaining lines
-    3. No markers — use full draft as body
-
-    Strips standalone CTA/signoff lines only.
-    Re-attaches correct HTML links exactly once.
+    Splits raw draft into (subject, body).
+    Three-level fallback for model format variations.
+    Strips CTA/signoff and re-attaches correct HTML.
     """
-    # Strip token footer
     divider = "─────────────────────"
     if divider in draft:
         draft = draft[:draft.index(divider)].strip()
 
-    lines   = draft.strip().split("\n")
-    subject = ""
-    body_lines = []
-    in_body    = False
+    lines            = draft.strip().split("\n")
+    subject          = ""
+    body_lines       = []
+    in_body          = False
     subject_line_idx = None
 
     for i, line in enumerate(lines):
@@ -410,7 +358,7 @@ def parse_draft(draft: str) -> tuple[str, str]:
 
         if re.match(r'^subject\s*:', stripped, re.I) \
            and not subject:
-            subject = re.split(
+            subject          = re.split(
                 r'subject\s*:', stripped, flags=re.I
             )[1].strip().strip('"\'')
             subject_line_idx = i
@@ -428,21 +376,13 @@ def parse_draft(draft: str) -> tuple[str, str]:
         if in_body:
             body_lines.append(line)
 
-    # ── FALLBACK 1: SUBJECT found, no BODY: ──
+    # Fallback 1: no BODY marker
     if not body_lines and subject_line_idx is not None:
-        print(
-            "⚠️  [PARSE] No BODY: marker — "
-            "using lines after SUBJECT"
-        )
         for line in lines[subject_line_idx + 1:]:
             body_lines.append(line)
 
-    # ── FALLBACK 2: no markers at all ────────
+    # Fallback 2: no markers at all
     if not body_lines and not subject:
-        print(
-            "⚠️  [PARSE] No markers found — "
-            "using full draft as body"
-        )
         body_lines = lines
 
     body = "\n".join(body_lines).strip()
@@ -452,11 +392,7 @@ def parse_draft(draft: str) -> tuple[str, str]:
     if not body:
         body = draft.strip()
 
-    # ── STRIP STANDALONE CTA / SIGNOFF LINES ─
-    # Only strip lines that are ENTIRELY a CTA
-    # or signoff — not lines that contain a call
-    # reference mid-paragraph
-
+    # Strip standalone CTA/signoff lines
     cta_patterns = [
         r'^worth a quick.*?call\??\.?$',
         r'^would you be open to a.*?call\??\.?$',
@@ -468,7 +404,6 @@ def parse_draft(draft: str) -> tuple[str, str]:
         r'^cal\.com',
         r'overlayCalendar',
     ]
-
     signoff_patterns = [
         r'^riley,?\s*davinci\s*ai\.?$',
         r'^riley,?\s*$',
@@ -479,51 +414,31 @@ def parse_draft(draft: str) -> tuple[str, str]:
         r'^riley,?\s*<a\s',
     ]
 
-    cleaned_lines = []
+    cleaned = []
     for line in body.split("\n"):
-        stripped   = line.strip()
-        lower      = stripped.lower()
+        stripped = line.strip()
+        lower    = stripped.lower()
 
-        is_cta = any(
-            re.match(p, lower)
-            for p in cta_patterns
-        ) or "overlayCalendar" in line
+        if any(re.match(p, lower) for p in cta_patterns) \
+           or "overlayCalendar" in line:
+            print(f"🧹 [PARSE] CTA: '{stripped[:50]}'")
+            continue
 
-        is_signoff = any(
+        if any(
             re.search(p, lower, re.I)
             for p in signoff_patterns
-        )
-
-        if is_cta:
-            print(
-                f"🧹 [PARSE] CTA stripped: "
-                f"'{stripped[:60]}'"
-            )
+        ):
+            print(f"🧹 [PARSE] Signoff: '{stripped[:50]}'")
             continue
 
-        if is_signoff:
-            print(
-                f"🧹 [PARSE] Signoff stripped: "
-                f"'{stripped[:60]}'"
-            )
-            continue
+        cleaned.append(line)
 
-        cleaned_lines.append(line)
-
-    body = "\n".join(cleaned_lines).strip()
-    body = body.rstrip(",. \n")
+    body = "\n".join(cleaned).strip().rstrip(",. \n")
 
     print(
         f"📝 [PARSE] subject='{subject}' "
-        f"body_chars={len(body)} "
-        f"preview='{body[:80]}'"
+        f"body={len(body)} chars"
     )
 
-    # Re-attach correct HTML links exactly once
-    body = (
-        f"{body}\n\n"
-        f"{CTA_LINE}\n\n"
-        f"{SIGNOFF_LINE}"
-    )
-
+    body = f"{body}\n\n{CTA_LINE}\n\n{SIGNOFF_LINE}"
     return subject, body

@@ -11,11 +11,12 @@ from dotenv import load_dotenv
 from memory import load_all_conversations, clear_history
 from agents.riley import (
     chat_with_riley,
-    draft_with_feedback
+    draft_with_feedback,
+    draft_outreach_email,
+    parse_draft
 )
 from agents.dexter import (
     chat_with_dexter,
-    research_businesses,
     is_in_elicitation,
     handle_elicitation_reply,
     start_elicitation,
@@ -24,16 +25,10 @@ from agents.dexter import (
     _needs_elicitation,
     _detect_ambiguity
 )
-from outreach_runner import (
-    process_prospect_from_db,
-    process_contact,
-    send_approved_email,
-    skip_contact,
-    save_redraft,
-    format_draft_for_slack,
-    generate_summary,
-    is_auto_mode,
-    set_auto_mode
+from flows.research_flow  import run_research_flow
+from flows.reachout_flow  import (
+    run_verified_send,
+    format_human_review_for_slack
 )
 from tools.file_reader import (
     read_contact_list,
@@ -48,6 +43,7 @@ from tools.prospect_db import (
     add_prospect,
     get_prospects,
     get_prospects_for_outreach,
+    get_good_leads_for_region,
     get_prospect_by_name,
     update_prospect_status,
     start_research_session,
@@ -55,8 +51,14 @@ from tools.prospect_db import (
     format_prospects_for_slack,
     format_pipeline_summary_for_slack,
     format_segment_summary_for_slack,
+    format_analytics_for_slack,
     get_pipeline_summary,
-    get_segment_summary
+    get_segment_summary,
+    get_analytics_summary,
+    get_human_review_queue,
+    create_research_request,
+    get_active_research_requests,
+    extract_region,
 )
 from tools.research_queue import (
     save_queue,
@@ -66,6 +68,8 @@ from tools.research_queue import (
     clear_queue,
     get_queue_summary
 )
+from tools.email_sender import check_send_limits
+from tools.verifier import save_verification_result
 from interaction_log import (
     log_action,
     get_recent_logs,
@@ -75,26 +79,19 @@ from interaction_log import (
 load_dotenv()
 
 # ─────────────────────────────────────────
-# TWO SLACK APPS
+# SLACK APPS
 # ─────────────────────────────────────────
 
 riley_app = App(
     token=os.environ.get("RILEY_BOT_TOKEN"),
     signing_secret=os.environ.get("RILEY_SIGNING_SECRET")
 )
-
 dexter_app = App(
     token=os.environ.get("DEXTER_BOT_TOKEN"),
     signing_secret=os.environ.get("DEXTER_SIGNING_SECRET")
 )
-
-riley_client = WebClient(
-    token=os.environ.get("RILEY_BOT_TOKEN")
-)
-
-dexter_client = WebClient(
-    token=os.environ.get("DEXTER_BOT_TOKEN")
-)
+riley_client  = WebClient(token=os.environ.get("RILEY_BOT_TOKEN"))
+dexter_client = WebClient(token=os.environ.get("DEXTER_BOT_TOKEN"))
 
 approval_state = {}
 queue_running  = set()
@@ -102,21 +99,17 @@ stop_requested = set()
 
 
 # ─────────────────────────────────────────
-# DOWNLOAD FILE FROM SLACK
+# FILE DOWNLOAD
 # ─────────────────────────────────────────
 
-def download_slack_file(
-    file_info: dict,
-    bot_token: str
-) -> str:
+def download_slack_file(file_info: dict, bot_token: str) -> str:
     import requests
-    file_url  = file_info["url_private_download"]
-    file_name = file_info["name"]
-    headers   = {"Authorization": f"Bearer {bot_token}"}
-    response  = requests.get(file_url, headers=headers)
-    suffix    = (
-        ".csv" if file_name.endswith(".csv") else ".xlsx"
+    headers  = {"Authorization": f"Bearer {bot_token}"}
+    response = requests.get(
+        file_info["url_private_download"], headers=headers
     )
+    suffix = ".csv" if file_info["name"].endswith(".csv") \
+        else ".xlsx"
     with tempfile.NamedTemporaryFile(
         delete=False, suffix=suffix
     ) as tmp:
@@ -125,195 +118,70 @@ def download_slack_file(
 
 
 # ─────────────────────────────────────────
-# LEARN FROM APPROVAL
-# ─────────────────────────────────────────
-
-def _learn_from_approval(
-    user_id: str,
-    result:  dict
-):
-    contact = result["contact"]
-    subject = result.get("subject", "")
-    print(
-        f"✅ [LEARN] Approved: "
-        f"'{contact['business_name']}' — "
-        f"'{subject[:50]}'"
-    )
-    log_action(
-        action_type="approved",
-        contact_name=contact.get("name"),
-        business_name=contact.get("business_name"),
-        detail=f"Subject approved: {subject}"
-    )
-
-
-# ─────────────────────────────────────────
 # BULLET LIST HELPERS
 # ─────────────────────────────────────────
 
 def _parse_bullet_list(text: str) -> list[str]:
     import re as _re
-    lines  = text.strip().split("\n")
     result = []
-
-    for line in lines:
+    for line in text.strip().split("\n"):
         line    = line.strip()
-        if not line:
-            continue
-        cleaned = _re.sub(
-            r'^[\•\-\*\–\—]\s*', '', line
-        ).strip()
-        cleaned = _re.sub(
-            r'^\d+[\.\)]\s*', '', cleaned
-        ).strip()
+        cleaned = _re.sub(r'^[\•\-\*\–\—]\s*', '', line).strip()
+        cleaned = _re.sub(r'^\d+[\.\)]\s*', '', cleaned).strip()
         if cleaned and len(cleaned) > 3:
             result.append(cleaned)
-
     return result
 
 
 def _is_bullet_list(text: str) -> bool:
     import re as _re
-    lines = [
-        l.strip() for l in text.split("\n")
-        if l.strip()
-    ]
-    bullet_lines = sum(
-        1 for l in lines
-        if _re.match(r'^[\•\-\*\–\—\d]', l)
+    lines  = [l.strip() for l in text.split("\n") if l.strip()]
+    return sum(
+        1 for l in lines if _re.match(r'^[\•\-\*\–\—\d]', l)
+    ) >= 2
+
+
+# ─────────────────────────────────────────
+# LEARN FROM APPROVAL
+# ─────────────────────────────────────────
+
+def _learn_from_approval(user_id: str, result: dict):
+    contact = result["contact"]
+    log_action(
+        action_type="approved",
+        contact_name=contact.get("name"),
+        business_name=contact.get("business_name"),
+        detail=f"Subject: {result.get('subject', '')}"
     )
-    return bullet_lines >= 2
 
 
 # ═══════════════════════════════════════════
-# DEXTER — SINGLE RESEARCH RUN
+# DEXTER — RESEARCH RUNNER
 # ═══════════════════════════════════════════
 
 def _run_research(
-    user_id:     str,
-    instruction: str,
-    say,
-    industry:    str = None,
-    location:    str = None
+    user_id: str, instruction: str, say,
+    industry: str = None, location: str = None
 ):
+    """Runs Phase A research flow in background thread."""
     def _run():
-        session_id = start_research_session(
-            user_id, instruction
-        )
-
         try:
-            prospects = research_businesses(
+            run_research_flow(
+                raw_query=instruction,
                 user_id=user_id,
-                instruction=instruction,
-                say_fn=say,
-                industry=industry,
-                location=location
+                say_fn=say
             )
-
-            if not prospects:
-                complete_research_session(
-                    session_id, 0, "failed"
-                )
-                return
-
-            added      = []
-            duplicates = []
-            invalid    = []
-
-            for p in prospects:
-                p["source_query"] = instruction
-                result = add_prospect(p)
-
-                if result:
-                    added.append(p["business_name"])
-                else:
-                    name = p.get("business_name", "")
-                    if name and name.lower() not in [
-                        "none", "null", "unknown",
-                        "", "n/a", "not found"
-                    ]:
-                        duplicates.append(name)
-                    else:
-                        invalid.append(str(p))
-
-            complete_research_session(
-                session_id, len(added)
-            )
-
-            if not added and not duplicates:
-                say(
-                    "⚠️ No valid businesses added.\n"
-                    "Try more specific keywords."
-                )
-                return
-
-            lines = [
-                f"✅ *Research complete:* "
-                f"_{instruction}_\n"
-            ]
-
-            if added:
-                lines.append(
-                    f"*Added {len(added)} "
-                    f"new prospect"
-                    f"{'s' if len(added) > 1 else ''}:*"
-                )
-                for name in added:
-                    p_data = get_prospect_by_name(name)
-                    email  = (
-                        p_data.get("email") or "no email"
-                        if p_data else "no email"
-                    )
-                    loc = (
-                        p_data.get("location") or ""
-                        if p_data else ""
-                    )
-                    line = f"  🔬 *{name}*"
-                    if loc:
-                        line += f" — {loc}"
-                    line += f"\n     {email}"
-                    lines.append(line)
-
-            if duplicates:
-                lines.append(
-                    f"\n*Already in DB "
-                    f"({len(duplicates)}):*"
-                )
-                for name in duplicates:
-                    lines.append(f"  • {name}")
-
-            if invalid:
-                lines.append(
-                    f"\n_{len(invalid)} entries "
-                    f"had no business name — skipped_"
-                )
-
-            lines.append(
-                f"\n_Tell Riley *!run* to start "
-                f"drafting emails._"
-            )
-
-            say("\n\n".join(lines))
-
             log_action(
                 action_type="research",
-                detail=(
-                    f"Dexter: '{instruction}' — "
-                    f"{len(added)} added"
-                )
+                detail=f"Dexter: '{instruction}'"
             )
-
         except Exception as e:
             print(f"💥 [DEXTER] Run failed: {e}")
             say(f"❌ Research failed: {e}")
-            if session_id:
-                complete_research_session(
-                    session_id, 0, "failed"
-                )
 
-    thread = threading.Thread(target=_run)
-    thread.daemon = True
-    thread.start()
+    t        = threading.Thread(target=_run)
+    t.daemon = True
+    t.start()
 
 
 # ═══════════════════════════════════════════
@@ -322,190 +190,122 @@ def _run_research(
 
 def _run_queue(user_id: str, say):
     if user_id in queue_running:
-        print(
-            f"⚠️  [QUEUE] Already running for {user_id}"
-        )
         return
 
     def _run():
         queue_running.add(user_id)
-        print(f"▶️  [QUEUE] Starting for {user_id}")
-
         try:
             while True:
                 pending = get_pending_queue(user_id)
-
                 if not pending:
                     summary = get_queue_summary(user_id)
                     say(
-                        f"✅ *Queue complete!*\n\n"
-                        f"📊 Results:\n"
-                        f"• Completed: {summary['complete']}\n"
-                        f"• Failed: {summary['failed']}\n\n"
-                        f"_Tell Riley *!run* to start "
-                        f"sending emails._"
+                        f"✅ *Queue complete!*\n"
+                        f"Completed: {summary['complete']} · "
+                        f"Failed: {summary['failed']}\n\n"
+                        f"_Tell Riley *!run <region>* "
+                        f"to start outreach._"
                     )
                     break
 
-                total_left  = len(pending)
                 item        = pending[0]
                 instruction = item["instruction"]
                 queue_id    = item["id"]
                 position    = item["position"]
+                total_left  = len(pending)
 
                 say(
                     f"🔬 *Queue item {position + 1}* "
                     f"— {total_left} remaining\n"
-                    f"_Researching: {instruction}_"
+                    f"_{instruction}_"
                 )
 
-                session_id   = start_research_session(
-                    user_id, instruction
-                )
                 rate_limited = False
-
                 try:
-                    prospects = research_businesses(
+                    run_research_flow(
+                        raw_query=instruction,
                         user_id=user_id,
-                        instruction=instruction,
                         say_fn=say
-                    )
-
-                    added = []
-                    if prospects:
-                        for p in prospects:
-                            p["source_query"] = instruction
-                            result = add_prospect(p)
-                            if result:
-                                added.append(
-                                    p["business_name"]
-                                )
-
-                    complete_research_session(
-                        session_id, len(added)
                     )
                     mark_complete(queue_id)
 
-                    say(
-                        f"✅ *Done:* _{instruction}_\n"
-                        f"   Added {len(added)} prospect"
-                        f"{'s' if len(added) != 1 else ''}"
-                        f"{' — moving to next...' if total_left > 1 else '.'}"
-                    )
-
                 except Exception as e:
-                    err_str = str(e).lower()
+                    err = str(e).lower()
+                    is_rl = any(w in err for w in [
+                        "rate_limit", "quota", "exceeded"
+                    ])
 
-                    is_rate_limit = any(
-                        w in err_str for w in [
-                            "rate_limit", "rate limit",
-                            "quota", "tokens per day",
-                            "daily limit", "exceeded"
-                        ]
-                    )
-
-                    if is_rate_limit:
+                    if is_rl:
                         rate_limited = True
-                        complete_research_session(
-                            session_id, 0, "failed"
-                        )
                         say(
-                            f"🔴 *Daily research limit reached.*\n\n"
-                            f"The 70B model quota resets every 24 hours. "
-                            f"I'll check every hour and resume "
-                            f"automatically when the quota is back.\n\n"
-                            f"_{total_left} item"
-                            f"{'s' if total_left != 1 else ''} "
-                            f"still in queue — nothing lost._"
+                            f"🔴 *Daily research limit reached.*\n"
+                            f"Checking every hour — will resume "
+                            f"automatically.\n"
+                            f"_{total_left} items queued._"
                         )
 
                         check_count = 0
                         while True:
                             time.sleep(3600)
                             check_count += 1
-
                             try:
                                 from groq import Groq
-                                test_client = Groq(
+                                test = Groq(
                                     api_key=os.environ.get(
                                         "GROQ_API_KEY_DEXTER"
                                     )
-                                )
-                                test_client.chat.completions.create(
+                                ).chat.completions.create(
                                     model="openai/gpt-oss-120b",
-                                    messages=[{
-                                        "role":    "user",
-                                        "content": "hi"
-                                    }],
+                                    messages=[{"role": "user",
+                                               "content": "hi"}],
                                     max_tokens=5
                                 )
                                 say(
-                                    f"🟢 *Research quota restored!*\n"
+                                    f"🟢 *Quota restored!* "
                                     f"Resuming queue — "
-                                    f"*{total_left} item"
-                                    f"{'s' if total_left != 1 else ''} "
-                                    f"remaining*..."
+                                    f"{total_left} remaining..."
                                 )
                                 break
-
-                            except Exception as test_err:
-                                test_str = str(
-                                    test_err
-                                ).lower()
-                                still_limited = any(
-                                    w in test_str for w in [
-                                        "rate_limit",
-                                        "quota",
-                                        "exceeded"
-                                    ]
-                                )
-                                if still_limited:
+                            except Exception as te:
+                                ts = str(te).lower()
+                                if any(w in ts for w in [
+                                    "rate_limit", "quota"
+                                ]):
                                     say(
-                                        f"⏳ *Still rate limited* "
-                                        f"({check_count}h elapsed).\n"
-                                        f"Checking again in 1 hour...\n"
-                                        f"_{total_left} item"
-                                        f"{'s' if total_left != 1 else ''} "
-                                        f"queued._"
+                                        f"⏳ Still limited "
+                                        f"({check_count}h).\n"
+                                        f"Checking in 1 hour..."
                                     )
-                                    continue
                                 else:
                                     say(
                                         f"⚠️ Check error: "
-                                        f"{str(test_err)[:80]}\n"
+                                        f"{str(te)[:80]}\n"
                                         f"Attempting to resume..."
                                     )
                                     break
-
                     else:
                         mark_failed(queue_id, str(e))
-                        complete_research_session(
-                            session_id, 0, "failed"
-                        )
                         say(
-                            f"⚠️ *Failed:* _{instruction}_\n"
-                            f"Error: {str(e)[:100]}\n"
-                            f"Moving to next item..."
+                            f"⚠️ Failed: _{instruction}_\n"
+                            f"{str(e)[:100]}\nMoving on..."
                         )
 
                 if not rate_limited:
                     time.sleep(2)
 
         except Exception as e:
-            print(f"💥 [QUEUE] Runner crashed: {e}")
-            say(f"❌ Queue runner crashed: {e}")
-
+            print(f"💥 [QUEUE] Crashed: {e}")
+            say(f"❌ Queue error: {e}")
         finally:
             queue_running.discard(user_id)
-            print(f"⏹️  [QUEUE] Stopped for {user_id}")
 
-    thread = threading.Thread(target=_run)
-    thread.daemon = True
-    thread.start()
+    t        = threading.Thread(target=_run)
+    t.daemon = True
+    t.start()
 
 
 # ─────────────────────────────────────────
-# RESTORE QUEUES ON STARTUP
+# RESTORE QUEUES
 # ─────────────────────────────────────────
 
 def _restore_queues():
@@ -524,51 +324,37 @@ def _restore_queues():
             r["user_id"] for r in result.data
         ))
 
-        print(
-            f"▶️  [STARTUP] Resuming queues for "
-            f"{len(user_ids)} user(s)"
-        )
-
         for uid in user_ids:
             pending = get_pending_queue(uid)
             if not pending:
                 continue
 
-            def notify_and_resume(user_id, count):
+            def notify(user_id, count):
                 try:
                     dexter_client.chat_postMessage(
                         channel=user_id,
                         text=(
-                            f"👋 Back after restart.\n\n"
-                            f"Resuming research queue — "
-                            f"*{count} item"
-                            f"{'s' if count != 1 else ''} "
-                            f"remaining*.\nStarting now..."
+                            f"👋 Back after restart.\n"
+                            f"Resuming queue — "
+                            f"*{count} items remaining*."
                         )
                     )
-
                     def say(msg):
                         dexter_client.chat_postMessage(
                             channel=user_id, text=msg
                         )
-
                     _run_queue(user_id, say)
-
                 except Exception as e:
-                    print(
-                        f"⚠️  [STARTUP] Queue notify "
-                        f"failed {user_id}: {e}"
-                    )
+                    print(f"⚠️  [STARTUP] {e}")
 
-            t = threading.Thread(
-                target=notify_and_resume,
-                args=(uid, len(pending))
+            t        = threading.Thread(
+                target=notify, args=(uid, len(pending))
             )
             t.daemon = True
             t.start()
 
     except Exception as e:
-        print(f"❌ [STARTUP] Queue restore failed: {e}")
+        print(f"❌ [STARTUP] Queue restore: {e}")
 
 
 # ═══════════════════════════════════════════
@@ -586,46 +372,73 @@ def handle_dexter_dm(event, say):
     text    = event.get("text", "").strip()
 
     print(
-        f"\n🔬 [DEXTER DM] {user_id}: "
+        f"\n🔬 [DEXTER DM] "
         f"'{text[:60]}{'...' if len(text) > 60 else ''}'"
     )
+
+    # ── !segments ─────────────────────────
+    if text.lower() in ["!segments", "!segment", "!segs"]:
+        cancel_elicitation(user_id)
+        say(format_segment_summary_for_slack(
+            get_segment_summary()
+        ))
+        return
+
+    # ── !analytics ────────────────────────
+    if text.lower().startswith("!analytics"):
+        cancel_elicitation(user_id)
+        rows = get_analytics_summary(days=30)
+        say(format_analytics_for_slack(rows, days=30))
+        return
+
+    # ── !cycles ───────────────────────────
+    if text.lower() == "!cycles":
+        cancel_elicitation(user_id)
+        requests = get_active_research_requests()
+        if not requests:
+            say("📋 No active research requests.")
+            return
+        lines = ["*🔄 Active Research Requests*\n"]
+        for r in requests:
+            cycles = r.get("search_cycles", [])
+            latest = max(
+                (c["cycle_index"] for c in cycles),
+                default=0
+            )
+            lines.append(
+                f"*{r['raw_query']}*\n"
+                f"   Cycle {latest}/{7} — "
+                f"{r['good_leads_found']}/{r['target_size']} "
+                f"good leads\n"
+                f"   Status: {r['status']}"
+            )
+        say("\n\n".join(lines))
+        return
 
     # ── !prospects ────────────────────────
     if text.lower().startswith("!prospects"):
         cancel_elicitation(user_id)
-        parts   = text.lower().split()
-        status  = None
+        parts  = text.lower().split()
+        status = None
         segment = None
-
+        known_statuses = [
+            "researched", "draft_ready", "approved",
+            "sent", "replied", "closed", "skipped"
+        ]
         if len(parts) > 1:
-            known_statuses = [
-                "researched", "draft_ready", "approved",
-                "sent", "replied", "closed", "skipped"
-            ]
             if parts[1] in known_statuses:
                 status = parts[1]
             else:
                 segment = " ".join(parts[1:])
 
-        prospects = get_prospects(
-            status=status, limit=20, segment=segment
-        )
-        title = "📋 Prospect Pipeline"
-        if status:
-            title = f"📋 Prospects — {status}"
-        if segment:
-            title = f"📋 Prospects — {segment}"
-
-        say(format_prospects_for_slack(prospects, title))
-        return
-
-    # ── !segments ─────────────────────────
-    if text.lower() in [
-        "!segments", "!segment", "!segs"
-    ]:
-        cancel_elicitation(user_id)
-        summary = get_segment_summary()
-        say(format_segment_summary_for_slack(summary))
+        say(format_prospects_for_slack(
+            get_prospects(
+                status=status, limit=20, segment=segment
+            ),
+            title=(
+                f"📋 Prospects — {status or segment or 'all'}"
+            )
+        ))
         return
 
     # ── !resetrun ─────────────────────────
@@ -634,130 +447,86 @@ def handle_dexter_dm(event, say):
         say("🗑️ Research session cancelled.")
         return
 
-    # ── !queue status ─────────────────────
-    if text.lower() in [
-        "!queue", "!queue status", "!queuestatus"
-    ]:
+    # ── !queue commands ───────────────────
+    if text.lower() in ["!queue", "!queue status"]:
         pending = get_pending_queue(user_id)
         summary = get_queue_summary(user_id)
-
-        if not pending and summary["complete"] == 0 \
-           and summary["failed"] == 0:
+        if not pending and summary["complete"] == 0:
             say(
                 "📋 No queue active.\n\n"
-                "Paste a bulleted list to queue tasks:\n"
-                "```\n"
-                "• vegan restaurants Berlin, 20\n"
-                "• plant based brands Netherlands, 15\n"
-                "```"
+                "Paste a bullet list to queue research:\n"
+                "```\n• vegan leather UK, 200\n"
+                "• plant based Japan, 50\n```"
             )
             return
-
-        running_status = (
-            "🟢 *Running*"
-            if user_id in queue_running
+        running = "🟢 *Running*" \
+            if user_id in queue_running \
             else "⏸️ *Paused*"
-        )
-
-        lines = [
-            f"📋 *Research queue* — {running_status}\n"
-            f"✅ Complete: {summary['complete']} · "
-            f"⏳ Pending: {summary['pending']} · "
-            f"❌ Failed: {summary['failed']}\n"
+        lines   = [
+            f"📋 *Queue* — {running}\n"
+            f"✅ {summary['complete']} · "
+            f"⏳ {summary['pending']} · "
+            f"❌ {summary['failed']}\n"
         ]
-
-        if pending:
-            lines.append("*Pending items:*")
-            for item in pending[:10]:
-                lines.append(
-                    f"  {item['position'] + 1}. "
-                    f"{item['instruction']}"
-                )
-            if len(pending) > 10:
-                lines.append(
-                    f"  ...and {len(pending) - 10} more"
-                )
-
-        lines.append(
-            f"\n_*!queue clear* to cancel · "
-            f"*!queue resume* to restart if paused_"
-        )
+        for item in pending[:10]:
+            lines.append(
+                f"  {item['position']+1}. "
+                f"{item['instruction']}"
+            )
         say("\n".join(lines))
         return
 
-    # ── !queue clear ──────────────────────
-    if text.lower() in [
-        "!queue clear", "!clearqueue"
-    ]:
+    if text.lower() in ["!queue clear", "!clearqueue"]:
         clear_queue(user_id)
         say("🗑️ Queue cleared.")
         return
 
-    # ── !queue resume ─────────────────────
     if text.lower() in [
         "!queue resume", "!resumequeue", "!resume"
     ]:
         pending = get_pending_queue(user_id)
         if not pending:
-            say("📋 No pending items in queue.")
+            say("📋 No pending items.")
             return
         if user_id in queue_running:
-            say("⚠️ Queue is already running.")
+            say("⚠️ Queue already running.")
             return
-        say(
-            f"▶️ Resuming queue — "
-            f"*{len(pending)} item"
-            f"{'s' if len(pending) != 1 else ''} "
-            f"remaining*..."
-        )
+        say(f"▶️ Resuming — {len(pending)} items...")
         _run_queue(user_id, say)
         return
 
     # ── !add ─────────────────────────────
     if text.lower().startswith("!add "):
         cancel_elicitation(user_id)
-        business_query = text[5:].strip()
-        if not business_query:
-            say("⚠️ Example: *!add Monzo London UK*")
+        query = text[5:].strip()
+        if not query:
+            say("⚠️ Example: *!add Monzo UK*")
             return
-        _run_research(
-            user_id=user_id,
-            instruction=business_query,
-            say=say
-        )
+        _run_research(user_id=user_id, instruction=query, say=say)
         return
 
     # ── !research ────────────────────────
     if text.lower().startswith("!research "):
         cancel_elicitation(user_id)
         query = text[10:].strip()
-
         if not query:
-            say(
-                "⚠️ Example: "
-                "*!research vegan businesses USA*"
-            )
+            say("⚠️ Example: *!research vegan leather UK*")
             return
-
         if _needs_elicitation(query):
             say(start_elicitation(user_id, query))
         else:
-            ambiguity_q = _detect_ambiguity(query)
-            if ambiguity_q:
-                say(
-                    start_clarification(
-                        user_id=user_id,
-                        original=query,
-                        industry="businesses",
-                        location="the specified area",
-                        question=ambiguity_q
-                    )
-                )
+            aq = _detect_ambiguity(query)
+            if aq:
+                say(start_clarification(
+                    user_id=user_id, original=query,
+                    industry="businesses",
+                    location="the specified area",
+                    question=aq
+                ))
             else:
                 _run_research(
                     user_id=user_id,
-                    instruction=query,
-                    say=say
+                    instruction=query, say=say
                 )
         return
 
@@ -765,84 +534,64 @@ def handle_dexter_dm(event, say):
     if _is_bullet_list(text):
         cancel_elicitation(user_id)
         instructions = _parse_bullet_list(text)
-
         if not instructions:
             say("⚠️ Couldn't parse that list.")
             return
-
-        saved = save_queue(user_id, instructions)
-        if not saved:
-            say("❌ Failed to save queue. Try again.")
+        if not save_queue(user_id, instructions):
+            say("❌ Failed to save queue.")
             return
-
         lines = [
-            f"📋 *Queued {len(instructions)} research "
-            f"task{'s' if len(instructions) != 1 else ''}"
-            f" — starting now:*\n"
+            f"📋 *Queued {len(instructions)} tasks:*\n"
         ]
         for i, inst in enumerate(instructions):
-            lines.append(f"  {i + 1}. {inst}")
+            lines.append(f"  {i+1}. {inst}")
         lines.append(
-            f"\n_*!queue* to check progress · "
-            f"*!queue clear* to cancel_"
+            "\n_*!queue* to check · *!queue clear* to cancel_"
         )
         say("\n".join(lines))
-
         if user_id not in queue_running:
             _run_queue(user_id, say)
-        else:
-            say("_Queue already running — items added._")
         return
 
-    # ── MID-ELICITATION / CLARIFICATION ──
+    # ── MID-ELICITATION ──────────────────
     if is_in_elicitation(user_id):
         question, query, industry, location = \
             handle_elicitation_reply(user_id, text)
-
         if question:
             say(question)
         elif query:
-            say(
-                f"✅ Got it — searching for *{query}*..."
-            )
+            say(f"✅ Got it — searching for *{query}*...")
             _run_research(
-                user_id=user_id,
-                instruction=query,
-                say=say,
-                industry=industry,
+                user_id=user_id, instruction=query,
+                say=say, industry=industry,
                 location=location
             )
         return
 
-    # ── RESEARCH INTENT DETECTION ─────────
+    # ── RESEARCH INTENT ───────────────────
     research_signals = [
         "find", "search", "look for", "research",
         "get me", "i need", "can you find",
         "businesses", "companies", "shops",
-        "cafes", "bakeries", "agencies",
-        "startups", "brands", "stores",
-        "clients", "leads", "prospects"
+        "brands", "stores", "clients", "leads",
+        "prospects", "leather", "vegan", "plant"
     ]
     if any(s in text.lower() for s in research_signals):
         if _needs_elicitation(text):
             say(start_elicitation(user_id, text))
         else:
-            ambiguity_q = _detect_ambiguity(text)
-            if ambiguity_q:
-                say(
-                    start_clarification(
-                        user_id=user_id,
-                        original=text,
-                        industry="businesses",
-                        location="the specified area",
-                        question=ambiguity_q
-                    )
-                )
+            aq = _detect_ambiguity(text)
+            if aq:
+                say(start_clarification(
+                    user_id=user_id, original=text,
+                    industry="businesses",
+                    location="the specified area",
+                    question=aq
+                ))
             else:
                 _run_research(
                     user_id=user_id,
-                    instruction=text,
-                    say=say
+                    instruction=text, say=say
                 )
         return
 
@@ -867,39 +616,26 @@ def _persist_state(user_id: str):
 
 
 def start_outreach_run(
-    user_id:  str,
-    contacts: list[dict],
-    say,
-    source:   str = "csv",
-    segment:  str = None
+    user_id: str, contacts: list[dict], say,
+    source: str = "csv", segment: str = None
 ):
-    print(
-        f"🚀 [RILEY] Run ({source}) — "
-        f"{len(contacts)} contacts"
-        f"{(' segment=' + segment) if segment else ''}"
-    )
     clear_run_state(user_id)
     stop_requested.discard(user_id)
 
+    from outreach_runner import is_auto_mode
     mode_msg = (
-        "⚡ *Auto-send ON*"
-        if is_auto_mode(user_id)
-        else
-        "✋ *Approval mode ON* — "
-        "I'll show each draft first."
-    )
-
-    seg_note = (
-        f"\n📂 *Segment:* {segment}"
-        if segment else ""
+        "⚡ *Auto-send ON* (with verification)"
+        if is_auto_mode(user_id) else
+        "✋ *Approval mode ON* — I'll show drafts first."
     )
 
     say(
-        f"✅ Starting outreach for "
+        f"✅ Starting verified outreach for "
         f"*{len(contacts)} prospects*."
-        f"{seg_note}\n\n"
-        f"{mode_msg}\n\n"
-        f"_Type *STOP* at any time to pause the run._"
+        f"{f' 📂 Segment: {segment}' if segment else ''}\n\n"
+        f"{mode_msg}\n"
+        f"_Every email is verified (x1×x2≥0.81) before send._\n"
+        f"_Type *STOP* to pause._"
     )
 
     approval_state[user_id] = {
@@ -908,25 +644,19 @@ def start_outreach_run(
         "waiting":            False,
         "source":             source,
         "segment":            segment,
-        "stats": {
-            "sent":    0,
-            "skipped": 0,
-            "failed":  0
-        }
+        "stats": {"sent": 0, "skipped": 0, "failed": 0,
+                  "human_review": 0}
     }
     _persist_state(user_id)
     process_next_contact(user_id, say)
 
 
-def post_draft_for_approval(
-    user_id: str,
-    result:  dict,
-    say
-):
+def post_draft_for_approval(user_id: str, result: dict, say):
     if user_id not in approval_state:
         return
     approval_state[user_id]["pending_result"] = result
     approval_state[user_id]["waiting"]        = True
+    from outreach_runner import format_draft_for_slack
     contact = result["contact"]
     print(
         f"✋ [RILEY] Waiting: "
@@ -940,21 +670,19 @@ def process_next_contact(user_id: str, say):
         if user_id not in approval_state:
             return
 
-        # ── STOP CHECK ────────────────────
+        # Stop check
         if user_id in stop_requested:
             state = approval_state.get(user_id, {})
             stats = state.get("stats", {})
-            remaining = state.get(
-                "remaining_contacts", []
-            )
+            remaining = state.get("remaining_contacts", [])
             say(
                 f"⏹️ *Campaign stopped.*\n\n"
-                f"📊 Progress so far:\n"
+                f"📊 Progress:\n"
                 f"• Sent: {stats.get('sent', 0)}\n"
                 f"• Skipped: {stats.get('skipped', 0)}\n"
-                f"• Failed: {stats.get('failed', 0)}\n\n"
-                f"_{len(remaining)} prospects "
-                f"not yet contacted._\n"
+                f"• Human review: "
+                f"{stats.get('human_review', 0)}\n\n"
+                f"_{len(remaining)} not yet contacted._\n"
                 f"_Type *!run* to start a new run._"
             )
             stop_requested.discard(user_id)
@@ -968,22 +696,14 @@ def process_next_contact(user_id: str, say):
         stats     = state["stats"]
         source    = state.get("source", "csv")
 
-        print(
-            f"📋 [RILEY LOOP] "
-            f"{len(remaining)} remaining"
-        )
-
         if not remaining:
-            total = (
-                stats["sent"] +
-                stats["skipped"] +
-                stats["failed"]
-            )
+            from outreach_runner import generate_summary
+            total = sum(stats.values())
             say(generate_summary(
                 total=total,
                 sent=stats["sent"],
                 skipped=stats["skipped"],
-                failed=stats["failed"]
+                failed=stats.get("failed", 0)
             ))
             clear_run_state(user_id)
             del approval_state[user_id]
@@ -994,50 +714,15 @@ def process_next_contact(user_id: str, say):
             contact.get("business_name") or
             contact.get("name", "unknown")
         )
-        print(f"▸  [RILEY LOOP] {biz_name}")
 
-        if source == "db":
-            email = contact.get("email") or ""
-            email = str(email).strip()
-
-            if not email or \
-               email.lower() in [
-                   "", "none", "null",
-                   "n/a", "not found"
-               ] or "@" not in email:
-                stats["skipped"] += 1
-                _persist_state(user_id)
-                say(
-                    f"⏭️ Skipping *{biz_name}* — "
-                    f"no valid email."
-                )
-                t = threading.Thread(
-                    target=process_next_contact,
-                    args=(user_id, say)
-                )
-                t.daemon = True
-                t.start()
-                return
-
-            result = process_prospect_from_db(
-                user_id=user_id,
-                prospect=contact,
-                say_fn=say
-            )
-        else:
-            result = process_contact(
-                user_id=user_id,
-                contact=contact,
-                say_fn=say
-            )
-
-        if result is None:
-            if source == "db":
-                stats["skipped"] += 1
-            else:
-                stats["failed"] += 1
+        # Validate email
+        email = str(contact.get("email") or "").strip()
+        if not email or "@" not in email or \
+           email.lower() in ["none", "null", "n/a"]:
+            stats["skipped"] += 1
             _persist_state(user_id)
-            t = threading.Thread(
+            say(f"⏭️ Skipping *{biz_name}* — no valid email.")
+            t        = threading.Thread(
                 target=process_next_contact,
                 args=(user_id, say)
             )
@@ -1045,205 +730,338 @@ def process_next_contact(user_id: str, say):
             t.start()
             return
 
+        # Draft email
+        say(f"✍️ Drafting for *{biz_name}*...")
+
+        contact_name = (
+            contact.get("contact_name") or biz_name
+        )
+        research = contact.get("research_summary", "")
+
+        try:
+            draft = draft_outreach_email(
+                user_id=user_id,
+                contact_name=contact_name,
+                business_name=biz_name,
+                research=research
+            )
+            subject, body = parse_draft(draft)
+
+        except Exception as e:
+            say(f"⚠️ Draft failed for *{biz_name}*: {e}")
+            stats["failed"] = stats.get("failed", 0) + 1
+            _persist_state(user_id)
+            t        = threading.Thread(
+                target=process_next_contact,
+                args=(user_id, say)
+            )
+            t.daemon = True
+            t.start()
+            return
+
+        result = {
+            "contact": {
+                "name":          contact_name,
+                "business_name": biz_name,
+                "email":         email,
+                "prospect_id":   contact.get("id"),
+            },
+            "draft":    draft,
+            "subject":  subject,
+            "body":     body,
+            "prospect": contact,
+        }
+
+        from outreach_runner import is_auto_mode
+
         if is_auto_mode(user_id):
-            contact_info = result["contact"]
-            success = send_approved_email(result)
-            if success:
+            # Auto mode: verify then send
+            can_send, limit_reason = check_send_limits()
+            if not can_send:
+                say(
+                    f"⏸️ *Send limit reached:* "
+                    f"{limit_reason}\n"
+                    f"Remaining prospects saved for "
+                    f"tomorrow's run."
+                )
+                _persist_state(user_id)
+                return
+
+            def _redraft_fn(feedback: str) -> str:
+                new_draft, _ = draft_with_feedback(
+                    user_id=user_id,
+                    feedback=feedback,
+                    original_draft=draft,
+                    contact_name=contact_name,
+                    business_name=biz_name
+                )
+                return new_draft
+
+            send_result = run_verified_send(
+                user_id=user_id,
+                prospect=contact,
+                draft_subject=subject,
+                draft_body=body,
+                say_fn=say,
+                draft_fn=_redraft_fn,
+                approval_mode=False
+            )
+
+            if send_result["status"] == "sent":
                 stats["sent"] += 1
                 _learn_from_approval(user_id, result)
                 say(
-                    f"✅ Sent to "
-                    f"*{contact_info['name']}* "
-                    f"at "
-                    f"*{contact_info['business_name']}*"
+                    f"✅ Sent to *{contact_name}* "
+                    f"at *{biz_name}*\n"
+                    f"_x1={send_result.get('x1', 0):.2f} "
+                    f"x2={send_result.get('x2', 0):.2f} "
+                    f"combined="
+                    f"{send_result.get('combined', 0):.3f}_"
                 )
-            else:
-                stats["failed"] += 1
+
+            elif send_result["status"] == "human_review":
+                stats["human_review"] = (
+                    stats.get("human_review", 0) + 1
+                )
                 say(
-                    f"❌ Failed: "
-                    f"*{contact_info['name']}*."
+                    f"⚠️ *{biz_name}* → human review\n"
+                    f"_Verification failed after "
+                    f"3 attempts. Type *!review*._"
                 )
+
+            elif send_result["status"] == "rate_limited":
+                say(
+                    f"⏸️ *Send limit:* "
+                    f"{send_result.get('reason', '')}\n"
+                    f"Pausing campaign."
+                )
+                _persist_state(user_id)
+                return
+
+            else:
+                stats["failed"] = (
+                    stats.get("failed", 0) + 1
+                )
+                say(
+                    f"❌ Failed: *{biz_name}* — "
+                    f"{send_result.get('reason', 'error')}"
+                )
+
             _persist_state(user_id)
-            t = threading.Thread(
+            t        = threading.Thread(
                 target=process_next_contact,
                 args=(user_id, say)
             )
             t.daemon = True
             t.start()
+
         else:
+            # Approval mode: show draft for review
             _persist_state(user_id)
             post_draft_for_approval(user_id, result, say)
 
-    thread = threading.Thread(target=_run)
-    thread.daemon = True
-    thread.start()
+    t        = threading.Thread(target=_run)
+    t.daemon = True
+    t.start()
 
 
-def handle_file_upload(
-    event:   dict,
-    say,
-    user_id: str
-):
-    file_info = event["files"][0]
-    file_name = file_info.get("name", "")
-
-    if not file_name.endswith(
-        (".csv", ".xlsx", ".xls")
-    ):
-        say("⚠️ Please upload a .csv or .xlsx file.")
-        return
-
-    say(f"📂 Got *{file_name}* — reading contacts...")
-
-    try:
-        file_path = download_slack_file(
-            file_info,
-            os.environ.get("RILEY_BOT_TOKEN")
-        )
-
-        result = read_contact_list(file_path, user_id)
-
-        if isinstance(result, tuple):
-            contacts, skipped = result
-        else:
-            contacts = result
-            skipped  = []
-
-        if skipped:
-            skipped_lines = "\n".join(
-                [f"  • {s}" for s in skipped[:10]]
-            )
-            if len(skipped) > 10:
-                skipped_lines += (
-                    f"\n  • ...and "
-                    f"{len(skipped) - 10} more"
-                )
-            say(
-                f"⚠️ No emails for "
-                f"{len(skipped)} contacts:\n"
-                f"{skipped_lines}"
-            )
-
-        if not contacts:
-            say("❌ No contacts with emails found.")
-            return
-
-        start_outreach_run(
-            user_id=user_id,
-            contacts=contacts,
-            say=say,
-            source="csv"
-        )
-
-    except ValueError as e:
-        say(f"⚠️ Problem with file: {e}")
-    except Exception as e:
-        say(f"❌ Something went wrong: {e}")
-        log_action(
-            action_type="error",
-            detail=f"File upload error: {str(e)}"
-        )
-
-
-def handle_approval_reply(
-    user_id: str,
-    text:    str,
-    say
-):
+def handle_approval_reply(user_id: str, text: str, say):
     state   = approval_state[user_id]
     result  = state["pending_result"]
     stats   = state["stats"]
     contact = result["contact"]
 
-    print(
-        f"📨 [RILEY REPLY] '{text}' for "
-        f"{contact['name']}"
-    )
-
     state["waiting"]        = False
     state["pending_result"] = None
-    print(f"🔓 [RILEY] waiting cleared")
 
-    # ── APPROVE ──────────────────────────
+    # APPROVE
     if text.lower().strip() == "approve":
-        success = send_approved_email(result)
-        if success:
+        # Verify then send
+        can_send, limit_reason = check_send_limits()
+        if not can_send:
+            say(
+                f"⏸️ Send limit: {limit_reason}\n"
+                f"Draft saved — try again tomorrow."
+            )
+            state["pending_result"] = result
+            state["waiting"]        = True
+            return
+
+        say("🔬 Verifying draft before sending...")
+
+        def _redraft_fn(feedback: str) -> str:
+            nd, _ = draft_with_feedback(
+                user_id=user_id,
+                feedback=feedback,
+                original_draft=result["draft"],
+                contact_name=contact["name"],
+                business_name=contact["business_name"]
+            )
+            return nd
+
+        send_result = run_verified_send(
+            user_id=user_id,
+            prospect=result["prospect"],
+            draft_subject=result["subject"],
+            draft_body=result["body"],
+            say_fn=say,
+            draft_fn=_redraft_fn,
+            approval_mode=True
+        )
+
+        if send_result["status"] == "sent":
             stats["sent"] += 1
             _learn_from_approval(user_id, result)
             say(
                 f"✅ Sent to *{contact['name']}* "
-                f"at *{contact['business_name']}*. "
+                f"at *{contact['business_name']}*.\n"
+                f"_x1={send_result.get('x1', 0):.2f} "
+                f"x2={send_result.get('x2', 0):.2f}_\n"
+                f"Moving to next..."
+            )
+        elif send_result["status"] == "human_review":
+            stats["human_review"] = (
+                stats.get("human_review", 0) + 1
+            )
+            say(
+                f"⚠️ Verification failed — "
+                f"added to review queue.\n"
                 f"Moving to next..."
             )
         else:
-            stats["failed"] += 1
+            stats["failed"] = stats.get("failed", 0) + 1
             say("❌ Send failed. Moving to next...")
 
         _persist_state(user_id)
         process_next_contact(user_id, say)
         return
 
-    # ── SKIP ─────────────────────────────
+    # SKIP
     if text.lower().strip() == "skip":
+        from outreach_runner import skip_contact
         skip_contact(result)
         stats["skipped"] += 1
         say(
             f"⏭️ Skipped *{contact['name']}*. "
-            f"Moving to next...\n"
-            f"_Type *!run draft_ready* to retry later._"
+            f"Moving to next..."
         )
         _persist_state(user_id)
         process_next_contact(user_id, say)
         return
 
-    # ── REDRAFT WITH LEARNING ─────────────
-    print(f"✏️  [RILEY] Redraft: '{text[:80]}'")
-    say("Got it — redrafting with your feedback...")
-
-    from agents.riley import parse_draft
-
+    # REDRAFT
+    say("Got it — redrafting...")
     try:
         new_draft, learned = draft_with_feedback(
-            user_id=user_id,
-            feedback=text,
+            user_id=user_id, feedback=text,
             original_draft=result["draft"],
             contact_name=contact["name"],
             business_name=contact["business_name"]
         )
-
         new_subject, new_body = parse_draft(new_draft)
 
-        print(
-            f"✅ [RILEY] Redraft ready. "
-            f"Learned: '{learned}'"
-        )
-
         if learned:
-            say(
-                f"_Noted for all future drafts: "
-                f"\"{learned}\"_"
-            )
+            say(f"_Noted: \"{learned}\"_")
 
-        new_result = save_redraft(
-            result=result,
-            subject=new_subject,
-            body=new_body,
-            draft=new_draft
-        )
-
-        post_draft_for_approval(
-            user_id, new_result, say
-        )
+        new_result = {
+            **result,
+            "draft":   new_draft,
+            "subject": new_subject,
+            "body":    new_body,
+        }
+        post_draft_for_approval(user_id, new_result, say)
 
     except Exception as e:
-        print(f"💥 [RILEY] Redraft failed: {e}")
-        say(
-            f"⚠️ Redraft failed: {e}\n"
-            f"Reply *approve* or *skip*."
-        )
+        say(f"⚠️ Redraft failed: {e}\nReply *approve* or *skip*.")
         state["pending_result"] = result
         state["waiting"]        = True
-        print(f"🔒 [RILEY] Restored waiting")
+
+
+# ─────────────────────────────────────────
+# HUMAN REVIEW HANDLERS
+# ─────────────────────────────────────────
+
+def _handle_review_action(
+    user_id: str, text: str, say
+):
+    """Handles !approve-review, !redraft-review, !discard-review."""
+    import re as _re
+    match = _re.match(
+        r'!(approve|redraft|discard)-review\s+(\d+)',
+        text.lower().strip()
+    )
+    if not match:
+        return False
+
+    action = match.group(1)
+    index  = int(match.group(2)) - 1
+
+    queue = get_human_review_queue()
+    if index < 0 or index >= len(queue):
+        say(
+            f"⚠️ Item {index+1} not found. "
+            f"Type *!review* to see the queue."
+        )
+        return True
+
+    item        = queue[index]
+    prospect    = item.get("prospects", {})
+    biz_name    = prospect.get("business_name", "Unknown")
+    oe_id       = item["id"]
+    prospect_id = item["prospect_id"]
+
+    if action == "approve":
+        # Send as-is
+        from database import supabase
+        supabase.table("outreach_emails") \
+            .update({"send_status": "pending"}) \
+            .eq("id", oe_id) \
+            .execute()
+
+        success, mid, tid = __import__(
+            "tools.email_sender", fromlist=["send_email"]
+        ).send_email(
+            to_email=prospect.get("email", ""),
+            subject=item.get("draft_subject", ""),
+            body=item.get("draft_body", ""),
+            business_name=biz_name
+        )
+
+        if success:
+            from database import supabase
+            supabase.table("outreach_emails") \
+                .update({
+                    "send_status":      "sent",
+                    "gmail_message_id": mid,
+                    "gmail_thread_id":  tid,
+                }) \
+                .eq("id", oe_id) \
+                .execute()
+            update_prospect_status(prospect_id, "sent")
+            say(f"✅ Sent *{biz_name}* (manual approval).")
+        else:
+            say(f"❌ Send failed for *{biz_name}*.")
+
+    elif action == "redraft":
+        say(
+            f"What feedback should I use to redraft "
+            f"the email for *{biz_name}*?"
+        )
+        # Store context for next message
+        approval_state[f"review_{user_id}"] = {
+            "item": item, "prospect": prospect
+        }
+
+    elif action == "discard":
+        from database import supabase
+        supabase.table("outreach_emails") \
+            .update({"send_status": "failed"}) \
+            .eq("id", oe_id) \
+            .execute()
+        update_prospect_status(prospect_id, "skipped")
+        say(f"🗑️ Discarded *{biz_name}* from review queue.")
+
+    return True
 
 
 # ═══════════════════════════════════════════
@@ -1261,59 +1079,75 @@ def handle_riley_dm(event, say):
     text    = event.get("text", "").strip()
 
     print(
-        f"\n📧 [RILEY DM] {user_id}: "
+        f"\n📧 [RILEY DM] "
         f"'{text[:60]}{'...' if len(text) > 60 else ''}'"
     )
 
-    if user_id in approval_state:
-        s = approval_state[user_id]
-        print(
-            f"   [STATE] waiting={s.get('waiting')} "
-            f"remaining="
-            f"{len(s.get('remaining_contacts', []))}"
-        )
-
     # FILE UPLOAD
     if event.get("files"):
-        handle_file_upload(event, say, user_id)
+        file_info = event["files"][0]
+        if not file_info["name"].endswith(
+            (".csv", ".xlsx", ".xls")
+        ):
+            say("⚠️ Please upload a .csv or .xlsx file.")
+            return
+        say(f"📂 Got *{file_info['name']}* — reading...")
+        try:
+            path = download_slack_file(
+                file_info,
+                os.environ.get("RILEY_BOT_TOKEN")
+            )
+            result = read_contact_list(path, user_id)
+            contacts, skipped = (
+                result if isinstance(result, tuple)
+                else (result, [])
+            )
+            if skipped:
+                say(
+                    f"⚠️ {len(skipped)} contacts "
+                    f"skipped (no email)"
+                )
+            if contacts:
+                start_outreach_run(
+                    user_id=user_id, contacts=contacts,
+                    say=say, source="csv"
+                )
+        except Exception as e:
+            say(f"❌ Error: {e}")
         return
 
-    # ── STOP — highest priority ───────────
+    # STOP
     if text.strip().upper() == "STOP":
         if user_id in approval_state:
             stop_requested.add(user_id)
             state = approval_state[user_id]
-
             if state.get("waiting"):
+                from outreach_runner import skip_contact
                 result = state.get("pending_result")
                 if result:
                     skip_contact(result)
                 state["pending_result"] = None
                 state["waiting"]        = False
-
             say(
                 "⏹️ *Stopping campaign...*\n"
-                "_Finishing current action, "
-                "then halting. One moment._"
+                "_Finishing current action, then halting._"
             )
         else:
             say(
-                "ℹ️ No campaign currently running.\n"
-                "_Type *!run* to start one._"
+                "ℹ️ No campaign running.\n"
+                "_Type *!run <region>* to start one._"
             )
         return
 
-    # ── !run ─────────────────────────────
+    # !run
     if text.lower().startswith("!run"):
         parts   = text.split(None, 2)
         status  = "researched"
         segment = None
-
         known_statuses = [
             "researched", "draft_ready", "approved",
             "sent", "replied", "closed", "skipped"
         ]
-
         if len(parts) >= 2:
             if parts[1].lower() in known_statuses:
                 status = parts[1].lower()
@@ -1322,170 +1156,107 @@ def handle_riley_dm(event, say):
             else:
                 segment = " ".join(parts[1:]).strip()
 
-        print(
-            f"🚀 [RILEY CMD] !run "
-            f"status={status} segment={segment}"
-        )
-
-        prospects = get_prospects_for_outreach(
-            status=status,
-            limit=50,
-            segment=segment
-        )
-
-        print(
-            f"📋 [RILEY] Fetched {len(prospects)} "
-            f"prospects"
-        )
+        # Fetch good leads
+        if segment:
+            prospects = get_good_leads_for_region(
+                region=segment,
+                limit=50,
+                status=status
+            )
+        else:
+            prospects = get_prospects_for_outreach(
+                status=status, limit=50
+            )
 
         if not prospects:
             seg_hint = (
-                f" in segment *{segment}*"
-                if segment else ""
+                f" in *{segment}*" if segment else ""
             )
             say(
                 f"📋 No *{status.replace('_', ' ')}* "
-                f"prospects{seg_hint} found.\n\n"
-                f"• *!segments* to see all segments\n"
+                f"good leads{seg_hint}.\n\n"
+                f"• *!segments* to see what's available\n"
                 f"• Ask Dexter to research businesses"
             )
             return
 
-        with_email = [
-            p for p in prospects
-            if p.get("email") and
-            "@" in str(p.get("email", ""))
-        ]
-        without_email = len(prospects) - len(with_email)
-
-        if not with_email:
-            say(
-                f"⚠️ Found *{len(prospects)} prospects* "
-                f"but emails look invalid.\n"
-                f"Ask Dexter to re-research."
-            )
-            return
-
-        seg_label = (
-            f" in *{segment}*" if segment else ""
+        say(
+            f"✅ Found *{len(prospects)} verified leads*"
+            f"{f' in *{segment}*' if segment else ''}.\n"
+            f"Starting verified outreach..."
         )
-        msg = (
-            f"✅ Found *{len(with_email)} prospects*"
-            f"{seg_label}."
-        )
-        if without_email > 0:
-            msg += (
-                f"\n⚠️ {without_email} will be skipped "
-                f"(invalid email)."
-            )
-        msg += "\nStarting drafting now..."
-        say(msg)
 
         start_outreach_run(
-            user_id=user_id,
-            contacts=with_email,
-            say=say,
-            source="db",
-            segment=segment
+            user_id=user_id, contacts=prospects,
+            say=say, source="db", segment=segment
         )
         return
 
-    # ── !pipeline ────────────────────────
+    # !review
+    if text.lower() == "!review":
+        queue = get_human_review_queue()
+        say(format_human_review_for_slack(queue))
+        return
+
+    # !approve/redraft/discard-review
+    if text.lower().startswith(
+        ("!approve-review", "!redraft-review",
+         "!discard-review")
+    ):
+        if _handle_review_action(user_id, text, say):
+            return
+
+    # !pipeline
     if text.lower().startswith("!pipeline"):
         parts  = text.lower().split()
         status = parts[1] if len(parts) > 1 else None
-
         if status:
-            prospects = get_prospects(
-                status=status, limit=30
-            )
             say(format_prospects_for_slack(
-                prospects,
-                f"📋 Prospects — "
-                f"{status.replace('_', ' ')}"
+                get_prospects(status=status, limit=30),
+                f"📋 Prospects — {status}"
             ))
         else:
-            counts = get_pipeline_summary()
-            say(
-                format_pipeline_summary_for_slack(counts)
-            )
+            say(format_pipeline_summary_for_slack(
+                get_pipeline_summary()
+            ))
         return
 
-    # ── !segments ─────────────────────────
-    if text.lower() in [
-        "!segments", "!segment", "!segs"
-    ]:
-        summary = get_segment_summary()
-        say(format_segment_summary_for_slack(summary))
+    # !segments
+    if text.lower() in ["!segments", "!segment", "!segs"]:
+        say(format_segment_summary_for_slack(
+            get_segment_summary()
+        ))
         return
 
-    # ── !prospects ────────────────────────
-    if text.lower().startswith("!prospects"):
-        parts   = text.lower().split()
-        status  = None
-        segment = None
-
-        if len(parts) > 1:
-            known_statuses = [
-                "researched", "draft_ready", "approved",
-                "sent", "replied", "closed", "skipped"
-            ]
-            if parts[1] in known_statuses:
-                status = parts[1]
-            else:
-                segment = " ".join(parts[1:])
-
-        prospects = get_prospects(
-            status=status, limit=30, segment=segment
-        )
-        title = "📋 Prospect Pipeline"
-        if status:
-            title = f"📋 Prospects — {status}"
-        if segment:
-            title = f"📋 Prospects — {segment}"
-
-        say(format_prospects_for_slack(prospects, title))
+    # !analytics
+    if text.lower().startswith("!analytics"):
+        rows = get_analytics_summary(days=30)
+        say(format_analytics_for_slack(rows))
         return
 
-    # ── !mark ────────────────────────────
+    # !mark
     if text.lower().startswith("!mark "):
         parts = text.split(" ", 2)
         if len(parts) < 3:
-            say(
-                "⚠️ Usage:\n"
-                "*!mark replied <business>*\n"
-                "*!mark closed <business>*"
-            )
+            say("⚠️ *!mark replied <business>*")
             return
-
-        action       = parts[1].lower().strip()
-        business_str = parts[2].strip()
-
+        action = parts[1].lower()
+        biz    = parts[2].strip()
         if action not in ["replied", "closed"]:
             say("⚠️ Valid: *replied* or *closed*")
             return
-
-        prospect = get_prospect_by_name(business_str)
-        if not prospect:
-            say(
-                f"⚠️ Could not find *{business_str}*.\n"
-                f"Type *!pipeline* to see all."
-            )
+        p = get_prospect_by_name(biz)
+        if not p:
+            say(f"⚠️ Not found: {biz}")
             return
-
-        update_prospect_status(
-            prospect_id=prospect["id"],
-            status=action
-        )
-        icon = "💬" if action == "replied" else "🏁"
+        update_prospect_status(p["id"], action)
         say(
-            f"{icon} *{prospect['business_name']}* "
-            f"marked as *{action}*."
+            f"{'💬' if action == 'replied' else '🏁'} "
+            f"*{p['business_name']}* → {action}"
         )
         return
 
-    # ── OTHER COMMANDS ────────────────────
-
+    # Other commands
     if text.lower() == "!reset":
         clear_history("riley", user_id)
         say("🔄 Memory cleared.")
@@ -1498,11 +1269,13 @@ def handle_riley_dm(event, say):
         return
 
     if text.lower() == "!automode on":
+        from outreach_runner import set_auto_mode
         set_auto_mode(user_id, True)
-        say("⚡ *Auto-send ON*")
+        say("⚡ *Auto-send ON* (with verification)")
         return
 
     if text.lower() == "!automode off":
+        from outreach_runner import set_auto_mode
         set_auto_mode(user_id, False)
         say("✋ *Approval mode ON*")
         return
@@ -1511,21 +1284,15 @@ def handle_riley_dm(event, say):
         from tools.preferences import get_preferences
         prefs = get_preferences(user_id)
         if not prefs:
-            say(
-                "🧠 No preferences saved yet.\n"
-                "Give feedback on any draft and I'll "
-                "remember it for all future emails."
-            )
+            say("🧠 No preferences saved yet.")
         else:
-            prefs_list = "\n".join(
-                [f"  {i+1}. {p}"
-                 for i, p in enumerate(prefs)]
-            )
             say(
-                f"🧠 *Saved preferences "
-                f"({len(prefs)}):*\n"
-                f"{prefs_list}\n\n"
-                f"_Type *!resetprefs* to clear all._"
+                f"🧠 *Preferences ({len(prefs)}):*\n"
+                + "\n".join(
+                    f"  {i+1}. {p}"
+                    for i, p in enumerate(prefs)
+                )
+                + "\n\n_*!resetprefs* to clear_"
             )
         return
 
@@ -1543,60 +1310,26 @@ def handle_riley_dm(event, say):
         say("🗑️ Run cancelled.")
         return
 
-    # ── APPROVAL REPLY ───────────────────
+    # Approval reply
     if user_id in approval_state and \
        approval_state[user_id].get("waiting"):
         handle_approval_reply(user_id, text, say)
         return
 
-    # ── PASTED TABLE ─────────────────────
-    if (
-        "\n" in text and
-        "@" in text and
-        ("|" in text or "\t" in text)
-    ):
-        result = parse_pasted_table(text, user_id)
-        if isinstance(result, tuple):
-            contacts, skipped = result
-        else:
-            contacts = result
-            skipped  = []
-
-        if contacts:
-            if skipped:
-                say(
-                    f"⚠️ Skipped {len(skipped)} "
-                    f"(no email)"
-                )
-            start_outreach_run(
-                user_id=user_id,
-                contacts=contacts,
-                say=say,
-                source="csv"
-            )
-            return
-
-    # ── GENERAL CHAT ─────────────────────
-    print(f"💬 [RILEY ROUTING] → chat")
+    # General chat
     say("_Thinking..._")
     say(chat_with_riley(user_id, text))
 
 
 # ─────────────────────────────────────────
-# RESTORE INTERRUPTED RUNS
+# RESTORE INTERRUPTED RILEY RUNS
 # ─────────────────────────────────────────
 
 def restore_interrupted_runs():
     interrupted = load_all_run_states()
-
     if not interrupted:
         print("✅ [STARTUP] No interrupted runs")
         return
-
-    print(
-        f"▶️  [STARTUP] Restoring "
-        f"{len(interrupted)} run(s)..."
-    )
 
     for row in interrupted:
         user_id   = row["user_id"]
@@ -1614,34 +1347,26 @@ def restore_interrupted_runs():
             "stats":              stats
         }
 
-        def notify_and_resume(uid, rem, sts):
+        def resume(uid, rem, sts):
             try:
                 riley_client.chat_postMessage(
                     channel=uid,
                     text=(
-                        f"👋 Back after restart.\n\n"
-                        f"Picking up outreach — "
-                        f"*{len(rem)} prospects "
-                        f"remaining*.\n"
-                        f"Progress: "
-                        f"{sts.get('sent', 0)} sent · "
-                        f"{sts.get('skipped', 0)} "
-                        f"skipped\n\nContinuing now..."
+                        f"👋 Back after restart.\n"
+                        f"*{len(rem)} prospects remaining*.\n"
+                        f"Continuing..."
                     )
                 )
-
                 def say(msg):
                     riley_client.chat_postMessage(
                         channel=uid, text=msg
                     )
-
                 process_next_contact(uid, say)
-
             except Exception as e:
                 print(f"⚠️  [STARTUP] {e}")
 
-        t = threading.Thread(
-            target=notify_and_resume,
+        t        = threading.Thread(
+            target=resume,
             args=(user_id, remaining, stats)
         )
         t.daemon = True
@@ -1653,24 +1378,38 @@ def restore_interrupted_runs():
 # ─────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("🚀 Starting DaVinci AI agents...")
+    print("🚀 Starting DaVinci AI v2.0...")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
     print("📚 Loading conversation history...")
     load_all_conversations()
 
-    print("▶️  Restoring interrupted Riley runs...")
+    print("▶️  Restoring Riley runs...")
     restore_interrupted_runs()
 
-    print("▶️  Restoring Dexter research queues...")
+    print("▶️  Restoring Dexter queues...")
     _restore_queues()
+
+    # Start background services
+    notify_user = os.environ.get("SLACK_CEO_USER_ID")
+    if notify_user:
+        from tools.followup_scheduler import (
+            start_followup_scheduler
+        )
+        start_followup_scheduler(riley_client, notify_user)
+        print("📅 Follow-up scheduler started.")
+    else:
+        print(
+            "⚠️  SLACK_CEO_USER_ID not set — "
+            "follow-up scheduler disabled"
+        )
 
     print("🔬 Starting Dexter...")
     dexter_handler = SocketModeHandler(
         dexter_app,
         os.environ.get("DEXTER_APP_TOKEN")
     )
-    dexter_thread = threading.Thread(
+    dexter_thread        = threading.Thread(
         target=dexter_handler.start
     )
     dexter_thread.daemon = True
@@ -1684,9 +1423,10 @@ if __name__ == "__main__":
     )
 
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    print("✅ Both agents live.")
-    print("   DM Dexter → research prospects.")
-    print("   DM Riley  → !run to start outreach.")
+    print("✅ DaVinci AI v2.0 live.")
+    print("   Dexter → research + verify leads")
+    print("   Riley  → draft + verify + send (Resend)")
+    print("   Follow-up scheduler → day 7 + day 14")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
     riley_handler.start()
