@@ -1,11 +1,12 @@
 """
 Keyword Expansion Agent
-Generates semantically similar search terms using Groq.
+Generates semantically similar search terms via Groq.
 Fires when good_leads < target after a research cycle.
 k increases each cycle up to MAX_K.
 """
 
 import json
+import time
 from groq import Groq
 from config import FAST_MODEL, GROQ_API_KEY
 
@@ -17,78 +18,83 @@ def expand_keywords(
     already_tried: list[str]
 ) -> list[str]:
     """
-    Generates k new search terms for industry x location
-    that surface businesses not found in previous cycles.
-    Returns a list of clean search query strings.
+    Generates k new search terms combining industry
+    variants WITH the location already baked in.
+    Returns ready-to-use search query strings.
     """
     client    = Groq(api_key=GROQ_API_KEY)
     tried_str = json.dumps(already_tried)
 
     prompt = f"""You are helping find business leads online.
 
-Original search:
-  Industry: {industry}
-  Location: {location}
+Task: Generate {k} alternative Google search queries
+to find {industry} businesses in {location}.
 
-Already tried these search terms (do not repeat):
+Already tried (do not repeat these):
 {tried_str}
 
-Generate exactly {k} ALTERNATIVE search query strings
-that would find DIFFERENT businesses in the same category.
-
 Rules:
-- Each term must be different enough to surface new results
-- Think about different angles:
-  manufacturer vs retailer vs brand vs startup vs distributor
-  direct-to-consumer vs wholesale vs B2B
-  premium vs budget vs mass-market
-  online-only vs physical vs omnichannel
-- Include the location in each query
-- Keep each query concise (4-8 words)
-- Do NOT repeat any term from the already-tried list
+- Each query must include "{location}" in it
+- Each query should approach the category differently:
+  try different angles like: restaurant, eatery, dining,
+  plant-based, sustainable, organic, wholefood, health food,
+  juice bar, smoothie bar, eco, conscious, green, etc.
+- Queries should be 3-6 words
+- Think what someone would Google to find these businesses
 
-Reply with a JSON array of strings only.
-No explanation. No preamble. No markdown.
-Example: ["vegan leather brands uk", "bio leather manufacturers england"]
+Reply with a JSON array of strings ONLY.
+No explanation, no markdown, no extra text.
+Example: ["plant based restaurants Amsterdam", "vegan eateries Rotterdam"]
 """
 
-    try:
-        response = client.chat.completions.create(
-            model=FAST_MODEL,
-            max_tokens=300,
-            temperature=0.7,
-            messages=[{"role": "user", "content": prompt}]
-        )
+    for attempt in range(2):
+        try:
+            response = client.chat.completions.create(
+                model=FAST_MODEL,
+                max_tokens=300,
+                temperature=0.7,
+                messages=[{"role": "user", "content": prompt}]
+            )
 
-        raw   = response.choices[0].message.content.strip()
-        raw   = raw.replace("```json", "").replace(
-            "```", ""
-        ).strip()
-        terms = json.loads(raw)
+            raw   = response.choices[0].message.content.strip()
+            raw   = raw.replace("```json", "").replace(
+                "```", ""
+            ).strip()
 
-        if not isinstance(terms, list):
-            return _fallback_expand(industry, location, k)
+            # Extract JSON array if wrapped in text
+            import re
+            match = re.search(r'\[.*\]', raw, re.DOTALL)
+            if match:
+                raw = match.group(0)
 
-        tried_lower = {t.lower() for t in already_tried}
-        new_terms   = [
-            t for t in terms
-            if isinstance(t, str)
-            and t.strip().lower() not in tried_lower
-        ]
+            terms = json.loads(raw)
 
-        result = new_terms[:k]
-        print(
-            f"🔑 [KEYWORD EXPANDER] {len(result)} new "
-            f"terms for '{industry}' (k={k}):\n"
-            + "\n".join(f"  • {t}" for t in result)
-        )
-        return result
+            if not isinstance(terms, list):
+                return _fallback_expand(industry, location, k)
 
-    except json.JSONDecodeError:
-        return _fallback_expand(industry, location, k)
-    except Exception as e:
-        print(f"❌ [KEYWORD EXPANDER] Error: {e}")
-        return _fallback_expand(industry, location, k)
+            tried_lower = {t.lower() for t in already_tried}
+            new_terms   = [
+                t for t in terms
+                if isinstance(t, str)
+                and t.strip().lower() not in tried_lower
+            ]
+
+            result = [t.strip() for t in new_terms[:k]]
+            print(
+                f"🔑 [KEYWORD EXPANDER] {len(result)} terms:\n"
+                + "\n".join(f"  • {t}" for t in result)
+            )
+            return result
+
+        except Exception as e:
+            if "rate_limit" in str(e).lower() and attempt == 0:
+                print("⚠️  [KEYWORD EXPANDER] Rate limit — waiting 60s")
+                time.sleep(60)
+                continue
+            print(f"❌ [KEYWORD EXPANDER] Error: {e}")
+            break
+
+    return _fallback_expand(industry, location, k)
 
 
 def _fallback_expand(
@@ -96,15 +102,38 @@ def _fallback_expand(
     location: str,
     k:        int
 ) -> list[str]:
-    suffixes = [
-        "brands", "companies", "businesses",
-        "startups", "manufacturers", "retailers",
-        "distributors", "suppliers", "producers",
-        "shops", "stores"
+    """
+    Rule-based fallback — generates location-aware queries
+    without duplicating location in the term.
+    """
+    # Extract base industry (strip location if already there)
+    import re
+    base = re.sub(
+        re.escape(location), '', industry,
+        flags=re.IGNORECASE
+    ).strip().strip(',').strip()
+
+    if not base:
+        base = industry
+
+    variants = [
+        f"plant based {base} {location}",
+        f"vegan {base} {location}",
+        f"organic {base} {location}",
+        f"sustainable {base} {location}",
+        f"healthy {base} {location}",
+        f"eco {base} {location}",
+        f"{base} restaurant {location}",
+        f"{base} eatery {location}",
+        f"{base} dining {location}",
+        f"{base} food {location}",
     ]
-    terms = [
-        f"{industry} {s} {location}"
-        for s in suffixes[:k]
-    ]
-    print(f"⚠️  [KEYWORD EXPANDER] Fallback: {len(terms)} terms")
-    return terms
+
+    # Remove any that are the same as what we started with
+    result = [v for v in variants if v.strip()][:k]
+    print(
+        f"⚠️  [KEYWORD EXPANDER] Fallback: "
+        f"{len(result)} terms:\n"
+        + "\n".join(f"  • {t}" for t in result)
+    )
+    return result

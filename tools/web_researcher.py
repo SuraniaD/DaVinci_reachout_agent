@@ -1,6 +1,20 @@
+"""
+Web Researcher — DuckDuckGo search
+Generates diverse search queries for a given
+industry + location and returns raw result blocks
+for extraction.
+
+Key fixes:
+- Small delay between DDG calls to avoid rate limiting
+- Queries don't duplicate the location string
+- Keywords from expander already contain location —
+  don't append it again
+"""
+
 import re
+import time
+import random
 from ddgs import DDGS
-from interaction_log import log_action
 
 
 def search_businesses(
@@ -8,62 +22,34 @@ def search_businesses(
     max_results: int = 10
 ) -> str:
     """
-    Single search for small targets (≤10).
-    Returns raw text for 70B to process.
+    Single search. Returns raw text block.
+    Used for small targets (≤ 10).
     """
     try:
         print(
-            f"🌐 [WEB RESEARCHER] Searching: '{query}' "
-            f"(max {max_results})"
+            f"🌐 [WEB RESEARCHER] "
+            f"Searching: '{query}'"
         )
-
-        search_queries = [
-            query,
-            f"{query} contact email",
-            f"{query} owner founder website",
-            f"{query} list directory"
-        ]
-
-        all_results = []
+        results     = DDGS().text(query, max_results=max_results)
+        block_parts = []
         seen_urls   = set()
 
-        for q in search_queries:
-            try:
-                results = DDGS().text(
-                    q, max_results=max_results
-                )
-                for r in results:
-                    url = r.get("href", "")
-                    if url and url in seen_urls:
-                        continue
-                    seen_urls.add(url)
-                    if r.get("body"):
-                        all_results.append(
-                            f"Title: {r['title']}\n"
-                            f"URL: {url}\n"
-                            f"Body: {r['body']}\n"
-                        )
-            except Exception as e:
-                print(
-                    f"⚠️  [WEB RESEARCHER] "
-                    f"Query failed: {e}"
-                )
+        for r in results:
+            url = r.get("href", "")
+            if url in seen_urls:
                 continue
+            seen_urls.add(url)
+            if r.get("body"):
+                block_parts.append(
+                    f"Title: {r['title']}\n"
+                    f"URL: {url}\n"
+                    f"Body: {r['body']}\n"
+                )
 
-        if not all_results:
-            return ""
-
-        combined = "\n---\n".join(all_results)
+        combined = "\n---\n".join(block_parts)
         print(
             f"✅ [WEB RESEARCHER] "
-            f"{len(all_results)} results"
-        )
-        log_action(
-            action_type="research",
-            detail=(
-                f"Web search: '{query}' — "
-                f"{len(all_results)} results"
-            )
+            f"{len(block_parts)} results"
         )
         return combined
 
@@ -78,164 +64,104 @@ def _generate_queries(
     target:   int
 ) -> list[str]:
     """
-    Generates a large diverse set of search queries
-    tailored to the industry and location.
+    Generates a diverse set of search queries.
 
-    Strategy:
-    - City-by-city queries for regions/countries
-    - Sub-category queries (restaurants, brands,
-      manufacturers, retailers separately)
-    - Contact-focused queries (email, founder, owner)
-    - Directory and list queries
-    - Japanese/local language hints where applicable
-
-    More queries + more diversity = more unique results
-    after deduplication.
+    IMPORTANT: If the keyword already contains the
+    location (from keyword_expander), we don't append
+    it again. We check before combining.
     """
-    queries   = []
-    ind       = industry.strip()
-    loc       = location.strip()
+    loc_lower      = location.strip().lower()
+    ind_lower      = industry.strip().lower()
+    loc_in_keyword = loc_lower in ind_lower
 
-    # ── BASE QUERIES ─────────────────────
+    def q(*parts) -> str:
+        """Build query, skip location if already present."""
+        base = " ".join(p for p in parts if p)
+        if loc_in_keyword:
+            return base  # location already in industry string
+        return f"{base} {location}".strip()
+
+    queries = []
+
+    # Core queries
     queries += [
-        f"{ind} {loc}",
-        f"{ind} businesses {loc}",
-        f"{ind} companies {loc}",
-        f"{ind} brands {loc}",
-        f"{ind} {loc} contact email",
-        f"{ind} {loc} owner founder",
-        f"list of {ind} businesses {loc}",
-        f"{ind} {loc} directory",
-        f"top {ind} {loc}",
-        f"best {ind} {loc}",
-        f"{ind} {loc} small business",
-        f"{ind} startup {loc}",
-        f"{ind} {loc} shop store",
-        f"{ind} {loc} email contact website",
-        f"{ind} producer manufacturer {loc}",
-        f"{ind} retailer seller {loc}",
-        f"{ind} {loc} independent",
-        f"{ind} {loc} SME",
+        q(industry),
+        q(industry, "contact email"),
+        q(industry, "owner founder email"),
+        q(industry, "website"),
+        q("list of", industry),
+        q(industry, "directory"),
+        q("best", industry),
+        q("top", industry),
+        q(industry, "small business"),
+        q(industry, "independent"),
     ]
 
-    loc_lower = loc.lower()
+    # Email-focused
+    queries += [
+        q(industry, "email address"),
+        q(industry, "contact us"),
+        q(industry, "about us"),
+        q('"' + industry + '"', "email"),
+    ]
 
-    # ── JAPAN SPECIFIC ────────────────────
-    if any(w in loc_lower for w in [
-        "japan", "japanese", "tokyo"
-    ]):
-        cities = [
-            "Tokyo", "Osaka", "Kyoto", "Nagoya",
-            "Sapporo", "Fukuoka", "Kobe", "Sendai",
-            "Hiroshima", "Yokohama", "Kawasaki",
-            "Saitama", "Chiba", "Nagano", "Okinawa"
-        ]
-        for city in cities:
-            queries += [
-                f"{ind} {city} Japan",
-                f"{ind} {city} Japan email",
-                f"{ind} restaurant cafe {city}",
-                f"{ind} shop brand {city} Japan",
-            ]
-        # Japanese-market specific terms
-        queries += [
-            f"plant based food Japan vegan",
-            f"vegan restaurant Japan list",
-            f"plant based brand Japan online",
-            f"Japan vegan food company email",
-            f"plant protein Japan manufacturer",
-            f"vegan cafe Tokyo Osaka contact",
-            f"plant based diet Japan business",
-            f"Japan vegetarian vegan brand email",
-        ]
+    # Location-specific city queries
+    # Only add if location isn't already in keyword
+    if not loc_in_keyword:
+        city_map = {
+            "netherlands": [
+                "Amsterdam", "Rotterdam", "Utrecht",
+                "The Hague", "Eindhoven", "Groningen",
+                "Tilburg", "Almere", "Breda", "Nijmegen"
+            ],
+            "germany": [
+                "Berlin", "Munich", "Hamburg",
+                "Frankfurt", "Cologne", "Stuttgart",
+                "Düsseldorf", "Leipzig", "Dresden"
+            ],
+            "uk": [
+                "London", "Manchester", "Birmingham",
+                "Bristol", "Edinburgh", "Leeds",
+                "Glasgow", "Liverpool"
+            ],
+            "france": [
+                "Paris", "Lyon", "Marseille",
+                "Bordeaux", "Toulouse", "Nice"
+            ],
+            "japan": [
+                "Tokyo", "Osaka", "Kyoto",
+                "Yokohama", "Nagoya", "Fukuoka"
+            ],
+            "australia": [
+                "Sydney", "Melbourne", "Brisbane",
+                "Perth", "Adelaide"
+            ],
+            "usa": [
+                "New York", "Los Angeles", "Chicago",
+                "San Francisco", "Seattle", "Austin",
+                "Portland", "Denver"
+            ],
+        }
 
-    # ── EUROPE SPECIFIC ───────────────────
-    elif any(w in loc_lower for w in [
-        "europe", "european", "eu"
-    ]):
-        countries = [
-            "UK", "Germany", "Netherlands", "France",
-            "Spain", "Italy", "Sweden", "Denmark",
-            "Belgium", "Austria", "Switzerland",
-            "Norway", "Finland", "Poland", "Portugal"
-        ]
-        for country in countries:
-            queries += [
-                f"{ind} {country}",
-                f"{ind} {country} contact email",
-                f"{ind} business {country} SME",
-            ]
+        cities = city_map.get(loc_lower, [])
+        for city in cities[:5]:  # max 5 cities
+            queries.append(f"{industry} {city}")
+            queries.append(f"{industry} {city} email")
 
-    # ── USA SPECIFIC ─────────────────────
-    elif any(w in loc_lower for w in [
-        "usa", "us", "united states", "america"
-    ]):
-        cities = [
-            "New York", "Los Angeles", "Chicago",
-            "San Francisco", "Seattle", "Austin",
-            "Portland", "Denver", "Miami", "Boston",
-            "Philadelphia", "Atlanta", "Dallas"
-        ]
-        for city in cities:
-            queries += [
-                f"{ind} {city}",
-                f"{ind} {city} contact email",
-            ]
-
-    # ── UK SPECIFIC ──────────────────────
-    elif any(w in loc_lower for w in [
-        "uk", "united kingdom", "britain", "england"
-    ]):
-        cities = [
-            "London", "Manchester", "Birmingham",
-            "Edinburgh", "Bristol", "Leeds",
-            "Glasgow", "Liverpool", "Sheffield"
-        ]
-        for city in cities:
-            queries += [
-                f"{ind} {city}",
-                f"{ind} {city} contact email",
-            ]
-
-    # ── AUSTRALIA SPECIFIC ───────────────
-    elif "australia" in loc_lower:
-        cities = [
-            "Sydney", "Melbourne", "Brisbane",
-            "Perth", "Adelaide", "Gold Coast"
-        ]
-        for city in cities:
-            queries += [
-                f"{ind} {city} Australia",
-                f"{ind} {city} contact email",
-            ]
-
-    # ── GENERIC COUNTRY/REGION ───────────
-    else:
-        # For any other location, add capital/major
-        # city variants and contact-focused queries
-        queries += [
-            f"{ind} {loc} capital city",
-            f"{ind} {loc} major cities",
-            f"{ind} {loc} SME contact email website",
-            f"list {ind} {loc} businesses directory",
-            f"{ind} {loc} entrepreneur founder email",
-        ]
-
-    # ── REMOVE DUPLICATES ─────────────────
-    seen    = set()
-    unique  = []
-    for q in queries:
-        q_clean = q.strip().lower()
-        if q_clean not in seen:
+    # Deduplicate
+    seen   = set()
+    unique = []
+    for q_str in queries:
+        q_clean = q_str.strip().lower()
+        if q_clean not in seen and len(q_str.strip()) > 3:
             seen.add(q_clean)
-            unique.append(q.strip())
+            unique.append(q_str.strip())
 
     print(
         f"🌐 [WEB RESEARCHER] Generated "
-        f"{len(unique)} queries for '{ind}' in '{loc}' "
-        f"(target: {target})"
+        f"{len(unique)} queries for "
+        f"'{industry}' (target: {target})"
     )
-
     return unique
 
 
@@ -245,33 +171,35 @@ def search_businesses_multi_query(
     target:   int = 50
 ) -> list[str]:
     """
-    Generates many diverse search queries and
-    returns raw result blocks for 70B processing.
+    Runs multiple searches and returns a list of
+    raw result blocks for extraction.
 
-    Each block = one query's results as a string.
-    Caller processes blocks until target is reached.
-
-    Key improvements over the old version:
-    - City-by-city queries for better coverage
-    - Sub-category queries per business type
-    - Higher max_results per query (15 not 10)
-    - No hard cap on number of queries generated
+    Adds a small random delay between requests
+    to avoid DuckDuckGo rate limiting.
     """
-    queries     = _generate_queries(
-        industry=industry,
-        location=location,
-        target=target
-    )
+    queries         = _generate_queries(industry, location, target)
+    all_blocks      = []
+    seen_urls       = set()
+    total_results   = 0
+    consecutive_failures = 0
 
-    all_result_blocks = []
-    seen_urls         = set()
-    total_results     = 0
+    for i, query in enumerate(queries):
+        # Stop if we've hit too many consecutive failures
+        if consecutive_failures >= 5:
+            print(
+                f"⚠️  [WEB RESEARCHER] "
+                f"5 consecutive failures — pausing 30s"
+            )
+            time.sleep(30)
+            consecutive_failures = 0
 
-    for q in queries:
         try:
-            # Higher max_results per query = more raw
-            # material for the 70B model to extract from
-            results     = DDGS().text(q, max_results=15)
+            # Small delay between requests (0.5–1.5s)
+            # Skip delay on first query
+            if i > 0:
+                time.sleep(random.uniform(0.5, 1.5))
+
+            results     = DDGS().text(query, max_results=12)
             block_parts = []
 
             for r in results:
@@ -289,30 +217,38 @@ def search_businesses_multi_query(
                     total_results += 1
 
             if block_parts:
-                all_result_blocks.append(
+                all_blocks.append(
                     "\n---\n".join(block_parts)
                 )
+                consecutive_failures = 0
+            else:
+                consecutive_failures += 1
 
             print(
-                f"   🔍 '{q[:55]}' → "
+                f"   🔍 '{query[:55]}' → "
                 f"{len(block_parts)} results "
                 f"(total unique: {total_results})"
             )
 
         except Exception as e:
-            print(
-                f"⚠️  [WEB RESEARCHER] "
-                f"Query failed: {e}"
-            )
+            err = str(e).lower()
+            if "no results" in err or "ratelimit" in err:
+                consecutive_failures += 1
+                print(
+                    f"   ⚠️  '{query[:40]}' — "
+                    f"no results ({consecutive_failures} streak)"
+                )
+            else:
+                print(f"   ❌ Query failed: {e}")
+                consecutive_failures += 1
             continue
 
     print(
         f"✅ [WEB RESEARCHER] "
         f"{total_results} unique results across "
-        f"{len(all_result_blocks)} batches"
+        f"{len(all_blocks)} batches"
     )
-
-    return all_result_blocks
+    return all_blocks
 
 
 def search_email_for_business(
@@ -320,51 +256,44 @@ def search_email_for_business(
     website:       str = None,
     location:      str = None
 ) -> str | None:
-    """
-    Dedicated email search for a specific business.
-    """
+    """Targeted email search for a specific business."""
     queries = []
 
     if website:
-        domain = website \
-            .replace("https://", "") \
-            .replace("http://",  "") \
-            .replace("www.",     "") \
-            .split("/")[0]
-        queries.append(
-            f'"{business_name}" email {domain}'
-        )
-        queries.append(
-            f"site:{domain} contact email"
-        )
+        domain = re.sub(
+            r'https?://(www\.)?', '', website
+        ).split('/')[0]
+        queries.append(f'"{business_name}" email {domain}')
+        queries.append(f"site:{domain} contact email")
 
     queries.append(
         f'"{business_name}" '
-        f'{location or ""} contact email'
+        f'{location or ""} contact email'.strip()
     )
 
-    email_pattern = r'[\w\.-]+@[\w\.-]+\.[a-zA-Z]{2,}'
+    email_pattern = re.compile(
+        r'[\w\.\-\+]+@[\w\.\-]+\.[a-zA-Z]{2,}'
+    )
+    junk = [
+        "example.com", "test.com", "shopify.com",
+        "wixpress.com", "sentry.io", "cloudflare.com",
+        "instagram.com", "facebook.com"
+    ]
 
     for q in queries:
         try:
+            time.sleep(random.uniform(0.3, 0.8))
             results = DDGS().text(q, max_results=5)
             for r in results:
-                text = (
+                text   = (
                     r.get("title", "") + " " +
                     r.get("body",  "")
                 )
-                emails = re.findall(email_pattern, text)
-
-                junk = [
-                    "example.com", "test.com",
-                    "shopify.com", "wixpress.com",
-                    "sentry.io"
-                ]
-                clean = [
+                emails = email_pattern.findall(text)
+                clean  = [
                     e.lower() for e in emails
                     if not any(j in e for j in junk)
                 ]
-
                 if clean:
                     print(
                         f"✅ [EMAIL SEARCH] "
@@ -373,10 +302,7 @@ def search_email_for_business(
                     return clean[0]
 
         except Exception as e:
-            print(
-                f"⚠️  [EMAIL SEARCH] "
-                f"Query failed: {e}"
-            )
+            print(f"⚠️  [EMAIL SEARCH] {e}")
             continue
 
     return None

@@ -365,13 +365,28 @@ def _extract_from_raw(
     Called by flows/research_flow.py.
     Uses Groq 120B for extraction.
     """
-    task = f"""
-Search intent: Find {industry} businesses
-{f'in {location}' if location and location.lower() not in ['worldwide', 'global', ''] else '(any location)'}.
+    loc_str = (
+        f'in {location}'
+        if location and
+        location.lower() not in ['worldwide', 'global', '']
+        else '(any location)'
+    )
 
-EXTRACT EVERY distinct business you can find.
-Include even partial results.
-Write research_summary with specific details — minimum 2 sentences.
+    task = f"""
+Search intent: Find {industry} businesses {loc_str}.
+
+INSTRUCTIONS:
+1. Extract EVERY distinct business name you see.
+2. For email: look carefully for any @domain.com pattern
+   in the text. Also check URLs — if you see a website
+   like "veganplace.nl", the email is likely info@veganplace.nl
+   or hello@veganplace.nl — include your best guess.
+3. For website: extract any URL you see for this business.
+4. If no email found at all, set email to null — do NOT
+   invent one. But do try to infer from the website domain.
+5. Include the business even if you only have name + website.
+6. Write research_summary: 2-3 specific sentences about
+   what this business does, their products/menu, location.
 
 Web search results:
 {raw[:8000]}

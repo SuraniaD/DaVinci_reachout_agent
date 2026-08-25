@@ -372,6 +372,30 @@ def run_research_flow(
                 keywords[0] if keywords else industry
             )
 
+            # If no email, try to find one before QC
+            email = (prospect.get("email") or "").strip()
+            if not email or "@" not in email:
+                website  = prospect.get("website") or ""
+                biz_name = prospect.get("business_name", "")
+                loc      = prospect.get("location", "")
+                try:
+                    from tools.web_researcher import (
+                        search_email_for_business
+                    )
+                    found = search_email_for_business(
+                        business_name=biz_name,
+                        website=website,
+                        location=loc
+                    )
+                    if found:
+                        prospect["email"] = found
+                        print(
+                            f"   📧 Found email for "
+                            f"'{biz_name}': {found}"
+                        )
+                except Exception:
+                    pass
+
             # Fast domain pre-check
             email = (prospect.get("email") or "").strip()
             if "@" in email:
