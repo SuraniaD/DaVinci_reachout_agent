@@ -9,11 +9,11 @@ load_dotenv()
 
 # Used for: keyword expansion, enrichment,
 # query parsing, follow-up drafting
-FAST_MODEL = "llama-3.1-8b-instant"
+FAST_MODEL = "openai/gpt-oss-20b"
 
 # Used for: research extraction, email drafting,
 # verification scoring, cross-verify judgment
-SMART_MODEL = "llama-3.3-70b-versatile"
+SMART_MODEL = "openai/gpt-oss-120b"
 
 GROQ_API_KEY_DEXTER = os.environ.get("GROQ_API_KEY_DEXTER")
 GROQ_API_KEY_RILEY  = os.environ.get("GROQ_API_KEY_RILEY")
