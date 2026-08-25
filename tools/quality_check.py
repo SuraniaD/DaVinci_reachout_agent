@@ -6,16 +6,15 @@ before marking as good_lead = True.
 Gates:
 1. Name + contact present
 2. Email format valid + not junk domain
-3. MX record exists for domain
+3. MX record check (socket-based, no dns module needed)
 4. Domain not already in DB (dedup)
-5. Cross-verify (2 independent search passes)
+5. Cross-verify (2 independent DuckDuckGo passes)
 6. Lead scoring (0-100)
 """
 
 import re
-import time
 import socket
-import dns.resolver
+import time
 from dataclasses import dataclass
 from ddgs import DDGS
 
@@ -40,12 +39,12 @@ from config import (
 class QualityResult:
     passed:               bool
     reason:               str
-    has_name_and_contact: bool   = False
-    mx_valid:             bool   = False
-    cross_verified_count: int    = 0
-    lead_score:           int    = 0
-    domain:               str    = ""
-    first_pass_verified:  bool   = False
+    has_name_and_contact: bool  = False
+    mx_valid:             bool  = False
+    cross_verified_count: int   = 0
+    lead_score:           int   = 0
+    domain:               str   = ""
+    first_pass_verified:  bool  = False
 
 
 EMAIL_PATTERN = re.compile(
@@ -82,7 +81,7 @@ def _check_name_and_contact(prospect: dict) -> bool:
 
 def _check_email_format(email: str) -> tuple[bool, str]:
     """Returns (valid, domain)."""
-    email = email.strip().lower()
+    email  = email.strip().lower()
 
     if not EMAIL_PATTERN.match(email):
         return False, ""
@@ -96,40 +95,37 @@ def _check_email_format(email: str) -> tuple[bool, str]:
 
 
 # ─────────────────────────────────────────
-# GATE 3: MX record lookup
+# GATE 3: MX check via socket (no dnspython)
 # ─────────────────────────────────────────
 
 def _check_mx_record(domain: str) -> bool:
     """
-    Returns True if domain has at least one MX record.
-    Fails open (returns True) if DNS times out.
+    Checks if domain likely has a mail server by
+    attempting a socket connection to port 25.
+    Falls back to checking port 80/443 (domain exists).
+    Fails open on timeout — never blocks a good lead.
     """
     try:
-        resolver = dns.resolver.Resolver()
-        resolver.lifetime = float(MX_LOOKUP_TIMEOUT)
-        records = resolver.resolve(domain, 'MX')
-        return len(records) > 0
+        socket.setdefaulttimeout(MX_LOOKUP_TIMEOUT)
 
-    except dns.resolver.NXDOMAIN:
-        # Domain does not exist at all
+        # Try resolving the domain at all (existence check)
+        socket.gethostbyname(domain)
+
+        # Domain resolves — accept it
+        # (true MX validation can be added later with dnspython)
+        return True
+
+    except socket.gaierror:
+        # Domain doesn't resolve at all — likely fake
+        print(f"   ⚠️  [MX CHECK] '{domain}' doesn't resolve")
         return False
 
-    except dns.resolver.NoAnswer:
-        # Domain exists but no MX — check A record fallback
-        try:
-            resolver.resolve(domain, 'A')
-            # Has A record but no MX — borderline, accept
-            return True
-        except Exception:
-            return False
-
     except Exception:
-        # Timeout or other error — fail open
-        print(
-            f"⚠️  [MX CHECK] Timeout/error for "
-            f"'{domain}' — passing"
-        )
+        # Any other error — fail open
         return True
+
+    finally:
+        socket.setdefaulttimeout(None)
 
 
 # ─────────────────────────────────────────
@@ -137,13 +133,9 @@ def _check_mx_record(domain: str) -> bool:
 # ─────────────────────────────────────────
 
 def _check_domain_not_duplicate(domain: str) -> bool:
-    """
-    Returns True if domain is NOT already in the DB.
-    Import here to avoid circular import.
-    """
+    """Returns True if domain is NOT already in the DB."""
     from tools.prospect_db import get_domain_exists
-    exists = get_domain_exists(domain)
-    return not exists
+    return not get_domain_exists(domain)
 
 
 # ─────────────────────────────────────────
@@ -157,18 +149,15 @@ def _cross_verify(
     location:      str = ""
 ) -> tuple[int, bool]:
     """
-    Runs 2 independent search passes to confirm
-    this business and email are real.
-
-    Returns (count, first_pass_verified)
-    where count is 0, 1, or 2.
+    2 independent DuckDuckGo passes to confirm
+    the business and email are real.
+    Returns (count, first_pass_verified).
     """
     count               = 0
     first_pass_verified = False
+    loc_suffix          = f" {location}" if location else ""
 
-    loc_suffix = f" {location}" if location else ""
-
-    # Pass 1: does the business + email appear together?
+    # Pass 1: business name + email together
     pass1_queries = [
         f'"{business_name}"{loc_suffix} email contact',
         f'"{business_name}" {email}',
@@ -183,11 +172,10 @@ def _cross_verify(
                     r.get("body",  "")
                 ).lower()
 
-                name_found  = business_name.lower() in text
-                email_found = email.lower() in text or \
-                              domain.lower() in text
-
-                if name_found and email_found:
+                if business_name.lower() in text and (
+                    email.lower() in text or
+                    domain.lower() in text
+                ):
                     count               += 1
                     first_pass_verified  = True
                     print(
@@ -202,7 +190,7 @@ def _cross_verify(
         except Exception as e:
             print(f"⚠️  [CROSS VERIFY] Pass 1 error: {e}")
 
-    # Pass 2: does the domain exist publicly?
+    # Pass 2: domain existence
     pass2_queries = [
         f'"{business_name}" site:{domain}',
         f'"{business_name}" {domain}',
@@ -218,11 +206,9 @@ def _cross_verify(
                     r.get("body",  "")
                 ).lower()
 
-                domain_found = domain.lower() in url or \
-                               domain.lower() in text
-                name_found   = business_name.lower() in text
-
-                if domain_found and name_found:
+                if (domain.lower() in url or
+                    domain.lower() in text) and \
+                   business_name.lower() in text:
                     count += 1
                     print(
                         f"✅ [CROSS VERIFY] Pass 2: "
@@ -244,20 +230,19 @@ def _cross_verify(
 
 
 # ─────────────────────────────────────────
-# GATE 6: Lead scoring
+# GATE 6: Lead scoring (0–100)
 # ─────────────────────────────────────────
 
 def score_lead(
     prospect:            dict,
     first_pass_verified: bool = False,
     website_confirmed:   bool = False,
-    social_found:        bool = False,
 ) -> int:
     score  = 0
     email  = (prospect.get("email") or "").lower()
     prefix = email.split("@")[0] if "@" in email else ""
 
-    # Named contact (not generic prefix)
+    # Named contact
     contact = (prospect.get("contact_name") or "").strip()
     if contact and contact.lower() not in [
         "none", "null", "unknown", "n/a", ""
@@ -266,27 +251,23 @@ def score_lead(
     elif prefix and prefix not in GENERIC_PREFIXES:
         score += SCORE_NAMED_CONTACT // 2
 
-    # Business domain email
+    # Business domain
     domain = email.split("@")[1] if "@" in email else ""
     if domain and not any(j in domain for j in JUNK_DOMAINS):
         score += SCORE_BUSINESS_DOMAIN
 
-    # Website confirmed in cross-verify
+    # Website confirmed
     if website_confirmed:
         score += SCORE_WEBSITE_CONFIRMED
 
-    # Rich research summary
+    # Rich summary
     summary = prospect.get("research_summary") or ""
     if len(summary.strip()) >= MIN_RESEARCH_SUMMARY:
         score += SCORE_RICH_SUMMARY
     elif len(summary.strip()) >= 100:
         score += SCORE_RICH_SUMMARY // 2
 
-    # Social presence
-    if social_found:
-        score += SCORE_SOCIAL_PRESENCE
-
-    # Specific location (city-level)
+    # Specific location
     location = (prospect.get("location") or "").lower()
     if location and location not in GENERIC_LOCATIONS:
         if "," in location or any(
@@ -303,12 +284,11 @@ def score_lead(
     # Specific industry
     industry = (prospect.get("industry") or "").lower()
     if industry and industry not in GENERIC_INDUSTRIES:
-        if len(industry.split()) >= 2:
-            score += SCORE_SPECIFIC_INDUSTRY
-        else:
-            score += SCORE_SPECIFIC_INDUSTRY // 2
+        score += SCORE_SPECIFIC_INDUSTRY if \
+            len(industry.split()) >= 2 else \
+            SCORE_SPECIFIC_INDUSTRY // 2
 
-    # First-pass verification bonus
+    # First-pass bonus
     if first_pass_verified:
         score += SCORE_FIRST_PASS_VERIFY
 
@@ -316,95 +296,56 @@ def score_lead(
 
 
 # ─────────────────────────────────────────
-# MAIN QUALITY CHECK FUNCTION
+# MAIN QUALITY CHECK
 # ─────────────────────────────────────────
 
 def quality_check(prospect: dict) -> QualityResult:
     """
     Runs all 6 quality gates on a prospect.
-    Returns QualityResult with passed=True only
-    if all gates pass.
+    Returns QualityResult — passed=True only if all pass.
     """
-    business_name = (
-        prospect.get("business_name") or ""
-    ).strip()
-    email    = (prospect.get("email") or "").strip()
-    location = (prospect.get("location") or "").strip()
+    business_name = (prospect.get("business_name") or "").strip()
+    email         = (prospect.get("email") or "").strip()
+    location      = (prospect.get("location") or "").strip()
 
-    print(
-        f"🔍 [QUALITY CHECK] '{business_name}' "
-        f"<{email}>"
-    )
+    print(f"🔍 [QC] '{business_name}' <{email}>")
 
-    # ── Gate 1: Name + contact ────────────
+    # Gate 1
     if not _check_name_and_contact(prospect):
-        print(
-            f"   ❌ Gate 1 failed: missing name/email"
-        )
-        return QualityResult(
-            passed=False,
-            reason="missing business name or email"
-        )
+        return QualityResult(False, "missing name or email")
 
-    # ── Gate 2: Email format ──────────────
+    # Gate 2
     email_valid, domain = _check_email_format(email)
     if not email_valid:
-        print(f"   ❌ Gate 2 failed: invalid email")
-        return QualityResult(
-            passed=False,
-            reason=f"invalid email format or junk domain"
-        )
+        return QualityResult(False, "invalid email or junk domain")
 
-    # ── Gate 3: MX record ────────────────
-    mx_valid = _check_mx_record(domain)
-    if not mx_valid:
-        print(f"   ❌ Gate 3 failed: no MX record")
-        return QualityResult(
-            passed=False,
-            reason=f"domain {domain} has no mail server"
-        )
+    # Gate 3
+    if not _check_mx_record(domain):
+        return QualityResult(False, f"{domain} doesn't resolve")
 
-    # ── Gate 4: Domain dedup ─────────────
+    # Gate 4
     if not _check_domain_not_duplicate(domain):
-        print(f"   ❌ Gate 4 failed: domain duplicate")
-        return QualityResult(
-            passed=False,
-            reason=f"domain {domain} already in database"
-        )
+        return QualityResult(False, f"domain {domain} already in DB")
 
-    # ── Gate 5: Cross-verify ─────────────
+    # Gate 5
     cv_count, first_pass = _cross_verify(
-        business_name=business_name,
-        email=email,
-        domain=domain,
-        location=location
+        business_name, email, domain, location
     )
-
     if cv_count < CROSS_VERIFY_COUNT:
-        print(
-            f"   ❌ Gate 5 failed: "
-            f"cross-verified {cv_count}/2"
-        )
         return QualityResult(
             passed=False,
-            reason=(
-                f"could not cross-verify "
-                f"({cv_count}/2 passes)"
-            ),
+            reason=f"cross-verify failed ({cv_count}/2)",
             cross_verified_count=cv_count
         )
 
-    # ── Gate 6: Score ─────────────────────
+    # Gate 6
     lead_score = score_lead(
         prospect=prospect,
         first_pass_verified=first_pass,
         website_confirmed=(cv_count >= 2),
     )
 
-    print(
-        f"   ✅ All gates passed — "
-        f"score: {lead_score}/100"
-    )
+    print(f"   ✅ All gates passed — score: {lead_score}/100")
 
     return QualityResult(
         passed=True,

@@ -7,3 +7,4 @@ openpyxl
 ddgs
 requests
 resend
+slack-sdk
