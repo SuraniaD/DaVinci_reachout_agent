@@ -295,7 +295,7 @@ Start with SUBJECT: on the very first line."""
     try:
         draft, tokens = _call_groq_with_retry(
             messages=[
-                {"role": "system", "content": email_skill},
+                {"role": "system", "content": system},
                 {"role": "user",   "content": task}
             ],
             max_tokens=600,
@@ -359,7 +359,7 @@ Output format: SUBJECT: on first line, then BODY: on its own line, then two para
     try:
         new_draft, tokens = _call_groq_with_retry(
             messages=[
-                {"role": "system", "content": email_skill},
+                {"role": "system", "content": system},
                 {"role": "user",   "content": task}
             ],
             max_tokens=600,
