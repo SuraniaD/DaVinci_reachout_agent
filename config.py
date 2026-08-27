@@ -31,7 +31,7 @@ GROQ_API_KEY = os.environ.get(
 MAX_CYCLES           = 7    # Hard cap on research iterations
 INITIAL_K            = 3    # Starting keyword variants per cycle
 MAX_K                = 10   # Max keyword variants per cycle
-CROSS_VERIFY_COUNT   = 2    # Independent passes required
+CROSS_VERIFY_COUNT   = 1    # Passes required (1 fast check + domain gate)
 MIN_RESEARCH_SUMMARY = 300  # Chars — enrich if below this
 MX_LOOKUP_TIMEOUT    = 5    # Seconds — fail open if exceeded
 

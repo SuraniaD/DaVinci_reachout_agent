@@ -226,21 +226,49 @@ def draft_outreach_email(
     Does NOT verify — verification happens in
     flows/reachout_flow.py after drafting.
     """
-    email_skill = _load_skill("email_template.txt")
+    # Load email skill — but use a strong default if file missing
+    raw_skill = _load_skill("email_template.txt")
+
+    # Always prepend the core research-usage instruction
+    # so template can't override it
+    research_instruction = """You write cold outreach emails for DaVinci AI.
+RULES:
+- Always reference specific facts from the research provided.
+- Never write generic openers like "I came across your company."
+- Paragraph 1 = specific hook about THEIR business (use research).
+- Paragraph 2 = what DaVinci AI does and why it fits THEIR situation.
+- Max 100 words body. Warm, peer-to-peer tone.
+- Format: SUBJECT: on line 1, then BODY: on its own line, then two paragraphs.
+"""
+    email_skill = research_instruction + "\n" + raw_skill
 
     from tools.preferences import build_preferences_block
     prefs = build_preferences_block(user_id)
     if prefs:
         email_skill = prefs + "\n\n" + email_skill
 
-    task = f"""Contact name:  {contact_name}
+    task = f"""You are writing a cold outreach email for DaVinci AI.
+
+Contact name:  {contact_name}
 Business name: {business_name}
 
-Research:
-{research[:800]}
+Research about this business:
+{research[:1200] if research else "No research available — write a general but personalised email based on the business name."}
 
-Write the email now. Follow the output format exactly.
-Start with SUBJECT: on the first line."""
+INSTRUCTIONS:
+- Paragraph 1: Write a specific hook referencing something real about this business from the research above. Mention their actual products, services, or what they do. Do NOT write generic lines like "I came across your business."
+- Paragraph 2: Explain what DaVinci AI does and why it's relevant to THIS specific business. Reference their likely pain points based on the research.
+- Keep it under 100 words total for the body.
+- Tone: warm, direct, peer-to-peer — not salesy.
+
+Format EXACTLY like this:
+SUBJECT: <one line subject>
+
+BODY:
+<paragraph 1>
+
+<paragraph 2>
+"""
 
     log_action(
         action_type="draft",

@@ -47,21 +47,108 @@ def _groq() -> Groq:
 # QUERY PARSER
 # ─────────────────────────────────────────
 
+def _spell_correct_location(text: str) -> str:
+    """
+    Fixes common misspellings of country/city names
+    before passing to the LLM parser.
+    """
+    corrections = {
+        # Netherlands variants
+        r'\bnetherland\b': 'Netherlands',
+        r'\bnethrelands\b': 'Netherlands',
+        r'\bnethreand\b': 'Netherlands',
+        r'\bholland\b': 'Netherlands',
+        # Germany
+        r'\bgermeny\b': 'Germany',
+        r'\bgemany\b': 'Germany',
+        r'\bgermany\b': 'Germany',
+        # United Kingdom
+        r'\bu\.k\b': 'UK',
+        r'\bunitied kingdom\b': 'United Kingdom',
+        r'\bbritian\b': 'United Kingdom',
+        r'\bbritain\b': 'United Kingdom',
+        # Japan
+        r'\bjappan\b': 'Japan',
+        r'\bjapan\b': 'Japan',
+        # France
+        r'\bfrance\b': 'France',
+        r'\bfarnce\b': 'France',
+        # Australia
+        r'\baustraila\b': 'Australia',
+        r'\baustralia\b': 'Australia',
+        # USA
+        r'\busa\b': 'USA',
+        r'\bus\b': 'USA',
+        r'\bamerica\b': 'USA',
+        r'\bunited states\b': 'USA',
+        # Sweden
+        r'\bsweden\b': 'Sweden',
+        r'\bswede\b': 'Sweden',
+        # Belgium
+        r'\bbelgium\b': 'Belgium',
+        r'\bbelgum\b': 'Belgium',
+        # Denmark
+        r'\bdenmark\b': 'Denmark',
+        r'\bdenmakr\b': 'Denmark',
+        # Spain
+        r'\bspain\b': 'Spain',
+        r'\bspain\b': 'Spain',
+        # Italy
+        r'\bitaly\b': 'Italy',
+        r'\bitaley\b': 'Italy',
+        # Canada
+        r'\bcanada\b': 'Canada',
+        r'\bcanda\b': 'Canada',
+        # Thailand
+        r'\bthailand\b': 'Thailand',
+        r'\bthaland\b': 'Thailand',
+        # India
+        r'\bindia\b': 'India',
+        r'\binida\b': 'India',
+    }
+    result = text
+    for pattern, replacement in corrections.items():
+        result = re.sub(
+            pattern, replacement, result,
+            flags=re.IGNORECASE
+        )
+    return result
+
+
+# Known countries/cities for regex fallback
+KNOWN_LOCATIONS = [
+    "Netherlands", "Holland", "Germany", "Deutschland",
+    "United Kingdom", "UK", "England", "Scotland",
+    "France", "Japan", "Australia", "USA", "America",
+    "United States", "Sweden", "Belgium", "Denmark",
+    "Spain", "Italy", "Canada", "Thailand", "India",
+    "Ireland", "Austria", "Switzerland", "Norway",
+    "Finland", "Poland", "Portugal", "Singapore",
+    "Amsterdam", "Rotterdam", "Berlin", "Munich",
+    "Hamburg", "London", "Paris", "Tokyo", "Osaka",
+    "Sydney", "Melbourne", "Toronto", "Vancouver",
+    "Stockholm", "Copenhagen", "Brussels", "Vienna",
+    "Madrid", "Barcelona", "Milan", "Rome",
+]
+
+
 def parse_query(raw_query: str) -> dict:
     """
     Parses natural language research request into:
     { industry, location, target_size }
     Uses Groq FAST_MODEL.
 
-    Strips command words (research, find, get me, etc.)
-    before passing to the model so they don't pollute
-    the industry field.
+    Strips command words and spell-corrects locations
+    before passing to the model.
     """
+    # Spell correct the whole query first
+    corrected = _spell_correct_location(raw_query)
+
     # Pre-clean: strip leading command words
     clean = re.sub(
         r'^\s*(research|find|get me|look for|search for|'
         r'i need|can you find|add|!research|!add)\s+',
-        '', raw_query.strip(), flags=re.IGNORECASE
+        '', corrected.strip(), flags=re.IGNORECASE
     ).strip()
 
     prompt = f"""You extract structured search parameters
@@ -72,31 +159,35 @@ Request: "{clean}"
 Reply with JSON only — no explanation, no markdown, no extra text:
 {{
   "industry": "<the type of business to search for>",
-  "location": "<country, city, or region — e.g. Netherlands, Tokyo, UK>",
-  "target_size": <how many businesses to find, integer, default 10>
+  "location": "<country or city — MUST be extracted from the request>",
+  "target_size": <integer, default 10 if not mentioned>
 }}
 
-Rules:
-- "industry" = what kind of business (e.g. "vegan cafes", "plant-based food brands", "eco leather manufacturers")
-- "location" = WHERE to search — extract from the request. Never use "worldwide" if a location is mentioned.
-- Strip command words like "research", "find", "get me" — they are not the industry
-- If no number mentioned, default target_size to 10
+CRITICAL RULES:
+- "industry" = ONLY the business type. Remove location names and numbers from it.
+- "location" = the country or city in the request. NEVER output "worldwide" or "global" if any country or city name appears.
+- Any country name in the request (Netherlands, Germany, Japan, UK, etc.) MUST be the location.
+- Numbers at the end = target_size, not part of industry.
+- Strip command words: research, find, get me, look for — not part of industry.
 
-Examples:
-  "vegan cafes in Netherlands, 50"
+Examples (follow these exactly):
+  "mock meats Netherlands, 50"
+  → {{"industry": "mock meat brands", "location": "Netherlands", "target_size": 50}}
+
+  "research vegan cafes in Netherlands, 50"
   → {{"industry": "vegan cafes", "location": "Netherlands", "target_size": 50}}
-
-  "research plant based food Japan, 30"
-  → {{"industry": "plant-based food businesses", "location": "Japan", "target_size": 30}}
 
   "find 200 mock meat brands in Germany"
   → {{"industry": "mock meat brands", "location": "Germany", "target_size": 200}}
 
-  "eco leather companies UK"
+  "plant based food Japan 30"
+  → {{"industry": "plant-based food businesses", "location": "Japan", "target_size": 30}}
+
+  "eco leather UK"
   → {{"industry": "eco leather companies", "location": "United Kingdom", "target_size": 10}}
 
   "vegan restaurants Amsterdam 20"
-  → {{"industry": "vegan restaurants", "location": "Amsterdam, Netherlands", "target_size": 20}}
+  → {{"industry": "vegan restaurants", "location": "Amsterdam", "target_size": 20}}
 """
 
     for attempt in range(2):
@@ -149,28 +240,36 @@ Examples:
             print(f"❌ [QUERY PARSER] Error: {e} | raw: {raw[:100] if 'raw' in dir() else 'n/a'}")
             break
 
-    # Fallback — regex-based extraction
-    # Strip command words
+    # Fallback — smart regex extraction using known locations
     clean_fb = re.sub(
         r'^(research|find|get me|look for|search for|'
         r'i need|can you find)\s+',
-        '', raw_query.strip(), flags=re.IGNORECASE
+        '', corrected.strip(), flags=re.IGNORECASE
     )
     number_match = re.search(r'\b(\d+)\b', clean_fb)
     target       = int(number_match.group(1)) if number_match else 10
-    # Try to extract location from common patterns
-    loc_match = re.search(
-        r'\bin\s+([A-Z][a-zA-Z\s]+?)(?:,|$)', clean_fb
-    )
-    location_fb = loc_match.group(1).strip() if loc_match else "worldwide"
-    # Industry = everything before the location or number
-    industry_fb = re.sub(
-        r'\s*,?\s*\d+.*$', '', clean_fb
-    ).strip()
-    industry_fb = re.sub(
-        r'\s+in\s+.*$', '', industry_fb,
-        flags=re.IGNORECASE
-    ).strip() or "businesses"
+
+    # Try to find a known location in the query
+    location_fb = "worldwide"
+    matched_loc = ""
+    for loc in sorted(KNOWN_LOCATIONS, key=len, reverse=True):
+        if re.search(r'\b' + re.escape(loc) + r'\b',
+                     clean_fb, re.IGNORECASE):
+            location_fb = loc
+            matched_loc = loc
+            break
+
+    # Industry = strip command words, numbers, location, "in"
+    industry_fb = clean_fb
+    industry_fb = re.sub(r'\s*,?\s*\d+.*$', '', industry_fb).strip()
+    industry_fb = re.sub(r'\s+in\s+.*$', '', industry_fb,
+                          flags=re.IGNORECASE).strip()
+    if matched_loc:
+        industry_fb = re.sub(
+            r'\b' + re.escape(matched_loc) + r'\b',
+            '', industry_fb, flags=re.IGNORECASE
+        ).strip().strip(',').strip()
+    industry_fb = industry_fb or "businesses"
 
     print(
         f"⚠️  [QUERY PARSER] Fallback: "
