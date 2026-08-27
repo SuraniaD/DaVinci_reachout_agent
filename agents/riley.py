@@ -217,39 +217,7 @@ def chat_with_riley(user_id: str, user_message: str) -> str:
 # DRAFT EMAIL
 # ─────────────────────────────────────────
 
-# Hardcoded email system prompt — no file dependency
-EMAIL_SYSTEM_PROMPT = """You are an expert cold email writer for DaVinci AI, an AI automation agency.
 
-DaVinci AI builds custom AI agent systems that automate repetitive business workflows:
-customer support, lead outreach, CRM updates, email handling, invoicing, bookkeeping,
-and operational tasks — so business owners focus on growth instead of admin.
-
-YOUR JOB: Write a short, specific, warm cold outreach email.
-
-STRICT RULES:
-1. Paragraph 1: Write a specific observation about THIS business using the research provided.
-   Reference their actual products, services, location, or what makes them unique.
-   NEVER start with "I came across", "I noticed", "I wanted to reach out", or any generic opener.
-   Start directly with something specific about them.
-
-2. Paragraph 2: Connect their specific situation to what DaVinci AI does.
-   Mention 1-2 specific tasks they likely do manually that AI could automate.
-   Keep it concrete, not vague.
-
-3. Total body length: 60-90 words. Two short paragraphs only.
-
-4. Tone: Peer-to-peer. Warm. Direct. Not salesy. Like a smart colleague, not a vendor.
-
-5. Output format — follow this EXACTLY, no deviations:
-SUBJECT: <subject line here>
-
-BODY:
-<paragraph 1 here>
-
-<paragraph 2 here>
-
-Do not add greetings, sign-offs, CTAs, or anything after paragraph 2.
-Write the subject and body only."""
 
 
 def draft_outreach_email(
@@ -260,30 +228,26 @@ def draft_outreach_email(
     Drafts a personalised outreach email using research.
     Verification happens separately in reachout_flow.py.
     """
+    system = _load_skill("email_template.txt")
+
     from tools.preferences import build_preferences_block
     prefs = build_preferences_block(user_id)
-
-    system = EMAIL_SYSTEM_PROMPT
     if prefs:
-        system = "CEO PREFERENCES (apply these):\n" + \
-                 "\n".join(prefs) + "\n\n" + system
+        system = "CEO PREFERENCES:\n" + "\n".join(prefs) + "\n\n" + system
 
     research_block = (
-        research.strip()[:1500]
+        research.strip()[:600]
         if research and research.strip()
-        else "No detailed research available for this business."
+        else "No research available."
     )
 
-    task = f"""Write a cold outreach email for this prospect.
-
-Business name: {business_name}
-Contact name: {contact_name}
+    task = f"""Business: {business_name}
+Contact: {contact_name}
 
 Research:
 {research_block}
 
-Now write the email following the STRICT RULES in your instructions.
-Start with SUBJECT: on the very first line."""
+Write the email now. Output SUBJECT: on line 1, then BODY: on its own line, then two paragraphs."""
 
     log_action(
         action_type="draft",
@@ -298,7 +262,7 @@ Start with SUBJECT: on the very first line."""
                 {"role": "system", "content": system},
                 {"role": "user",   "content": task}
             ],
-            max_tokens=600,
+            max_tokens=400,
             temperature=0.8
         )
 
@@ -342,7 +306,7 @@ def draft_with_feedback(
 
     from tools.preferences import build_preferences_block
     prefs = build_preferences_block(user_id)
-    system = EMAIL_SYSTEM_PROMPT
+    system = _load_skill("email_template.txt")
     if prefs:
         system = "CEO PREFERENCES:\n" + "\n".join(prefs) + "\n\n" + system
 
@@ -362,7 +326,7 @@ Output format: SUBJECT: on first line, then BODY: on its own line, then two para
                 {"role": "system", "content": system},
                 {"role": "user",   "content": task}
             ],
-            max_tokens=600,
+            max_tokens=400,
             temperature=0.7
         )
 
