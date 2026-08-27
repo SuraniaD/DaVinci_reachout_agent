@@ -217,58 +217,73 @@ def chat_with_riley(user_id: str, user_message: str) -> str:
 # DRAFT EMAIL
 # ─────────────────────────────────────────
 
+# Hardcoded email system prompt — no file dependency
+EMAIL_SYSTEM_PROMPT = """You are an expert cold email writer for DaVinci AI, an AI automation agency.
+
+DaVinci AI builds custom AI agent systems that automate repetitive business workflows:
+customer support, lead outreach, CRM updates, email handling, invoicing, bookkeeping,
+and operational tasks — so business owners focus on growth instead of admin.
+
+YOUR JOB: Write a short, specific, warm cold outreach email.
+
+STRICT RULES:
+1. Paragraph 1: Write a specific observation about THIS business using the research provided.
+   Reference their actual products, services, location, or what makes them unique.
+   NEVER start with "I came across", "I noticed", "I wanted to reach out", or any generic opener.
+   Start directly with something specific about them.
+
+2. Paragraph 2: Connect their specific situation to what DaVinci AI does.
+   Mention 1-2 specific tasks they likely do manually that AI could automate.
+   Keep it concrete, not vague.
+
+3. Total body length: 60-90 words. Two short paragraphs only.
+
+4. Tone: Peer-to-peer. Warm. Direct. Not salesy. Like a smart colleague, not a vendor.
+
+5. Output format — follow this EXACTLY, no deviations:
+SUBJECT: <subject line here>
+
+BODY:
+<paragraph 1 here>
+
+<paragraph 2 here>
+
+Do not add greetings, sign-offs, CTAs, or anything after paragraph 2.
+Write the subject and body only."""
+
+
 def draft_outreach_email(
     user_id: str, contact_name: str,
     business_name: str, research: str
 ) -> str:
     """
-    Drafts a personalised outreach email.
-    Does NOT verify — verification happens in
-    flows/reachout_flow.py after drafting.
+    Drafts a personalised outreach email using research.
+    Verification happens separately in reachout_flow.py.
     """
-    # Load email skill — but use a strong default if file missing
-    raw_skill = _load_skill("email_template.txt")
-
-    # Always prepend the core research-usage instruction
-    # so template can't override it
-    research_instruction = """You write cold outreach emails for DaVinci AI.
-RULES:
-- Always reference specific facts from the research provided.
-- Never write generic openers like "I came across your company."
-- Paragraph 1 = specific hook about THEIR business (use research).
-- Paragraph 2 = what DaVinci AI does and why it fits THEIR situation.
-- Max 100 words body. Warm, peer-to-peer tone.
-- Format: SUBJECT: on line 1, then BODY: on its own line, then two paragraphs.
-"""
-    email_skill = research_instruction + "\n" + raw_skill
-
     from tools.preferences import build_preferences_block
     prefs = build_preferences_block(user_id)
+
+    system = EMAIL_SYSTEM_PROMPT
     if prefs:
-        email_skill = prefs + "\n\n" + email_skill
+        system = "CEO PREFERENCES (apply these):\n" + \
+                 "\n".join(prefs) + "\n\n" + system
 
-    task = f"""You are writing a cold outreach email for DaVinci AI.
+    research_block = (
+        research.strip()[:1500]
+        if research and research.strip()
+        else "No detailed research available for this business."
+    )
 
-Contact name:  {contact_name}
+    task = f"""Write a cold outreach email for this prospect.
+
 Business name: {business_name}
+Contact name: {contact_name}
 
-Research about this business:
-{research[:1200] if research else "No research available — write a general but personalised email based on the business name."}
+Research:
+{research_block}
 
-INSTRUCTIONS:
-- Paragraph 1: Write a specific hook referencing something real about this business from the research above. Mention their actual products, services, or what they do. Do NOT write generic lines like "I came across your business."
-- Paragraph 2: Explain what DaVinci AI does and why it's relevant to THIS specific business. Reference their likely pain points based on the research.
-- Keep it under 100 words total for the body.
-- Tone: warm, direct, peer-to-peer — not salesy.
-
-Format EXACTLY like this:
-SUBJECT: <one line subject>
-
-BODY:
-<paragraph 1>
-
-<paragraph 2>
-"""
+Now write the email following the STRICT RULES in your instructions.
+Start with SUBJECT: on the very first line."""
 
     log_action(
         action_type="draft",
@@ -325,20 +340,21 @@ def draft_with_feedback(
             save_preference(user_id, pref)
             learned = pref
 
-    email_skill = _load_skill("email_template.txt")
     from tools.preferences import build_preferences_block
     prefs = build_preferences_block(user_id)
+    system = EMAIL_SYSTEM_PROMPT
     if prefs:
-        email_skill = prefs + "\n\n" + email_skill
+        system = "CEO PREFERENCES:\n" + "\n".join(prefs) + "\n\n" + system
 
-    task = f"""Feedback on this draft: "{feedback}"
+    task = f"""Rewrite this email draft applying the feedback below.
+
+Feedback: "{feedback}"
 
 Original draft:
 {original_draft}
 
-Rewrite applying this feedback exactly.
-SUBJECT: on first line, then BODY: on its own line,
-then two paragraphs."""
+Apply the feedback exactly. Keep what works, fix what was flagged.
+Output format: SUBJECT: on first line, then BODY: on its own line, then two paragraphs only."""
 
     try:
         new_draft, tokens = _call_groq_with_retry(
