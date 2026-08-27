@@ -403,37 +403,21 @@ def parse_draft(draft: str) -> tuple[str, str]:
     if not body:
         body = draft.strip()
 
-    # Strip ONLY our own injected lines — not model content
-    our_patterns = [
-        r'overlayCalendar',
-        r'cal\.com/deepanshu',
-        r'davinciai\.agency',
-        r'^riley,?\s*(davinci|<a|https?://)',
-        r'^[-—]\s*riley$',
-        r'^riley,?\s*$',
-    ]
-
+    # The template tells the model to write the CTA and
+    # signoff itself — trust the output, don't strip or append.
+    # Only skip leading blank lines.
     cleaned = []
     for line in body.split("\n"):
-        stripped = line.strip()
-        if not stripped and not cleaned:
-            continue  # skip leading blank lines only
-        is_ours = any(
-            re.search(p, stripped, re.I)
-            for p in our_patterns
-        )
-        if is_ours:
-            print(f"🧹 [PARSE] Stripped: '{stripped[:60]}'")
+        if not line.strip() and not cleaned:
             continue
         cleaned.append(line)
-
     body = "\n".join(cleaned).strip()
 
-    # Safety net: if body is still empty, grab raw content
+    # Safety net: body too short means parsing missed something
     if not body or len(body) < 20:
         print(
-            f"⚠️  [PARSE] Body empty ({len(body)} chars) "
-            f"— using raw draft"
+            f"⚠️  [PARSE] Body short ({len(body)} chars) "
+            f"— extracting from raw draft"
         )
         raw_body = []
         past_subject = False
@@ -452,5 +436,4 @@ def parse_draft(draft: str) -> tuple[str, str]:
         f"body={len(body)} chars"
     )
 
-    body = f"{body}\n\n{CTA_LINE}\n\n{SIGNOFF_LINE}"
     return subject, body
