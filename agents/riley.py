@@ -368,12 +368,17 @@ then two paragraphs."""
 def parse_draft(draft: str) -> tuple[str, str]:
     """
     Splits raw draft into (subject, body).
-    Three-level fallback for model format variations.
-    Strips CTA/signoff and re-attaches correct HTML.
+    Robust multi-fallback parser.
+    Only strips OUR OWN CTA/signoff lines —
+    never strips model-written content.
     """
+    # Remove token footer if present
     divider = "─────────────────────"
     if divider in draft:
         draft = draft[:draft.index(divider)].strip()
+
+    # Remove markdown code fences
+    draft = re.sub(r'```.*?```', '', draft, flags=re.DOTALL).strip()
 
     lines            = draft.strip().split("\n")
     subject          = ""
@@ -384,8 +389,7 @@ def parse_draft(draft: str) -> tuple[str, str]:
     for i, line in enumerate(lines):
         stripped = line.strip()
 
-        if re.match(r'^subject\s*:', stripped, re.I) \
-           and not subject:
+        if re.match(r'^subject\s*:', stripped, re.I) and not subject:
             subject          = re.split(
                 r'subject\s*:', stripped, flags=re.I
             )[1].strip().strip('"\'')
@@ -404,10 +408,9 @@ def parse_draft(draft: str) -> tuple[str, str]:
         if in_body:
             body_lines.append(line)
 
-    # Fallback 1: no BODY marker
+    # Fallback 1: no BODY marker — take everything after SUBJECT
     if not body_lines and subject_line_idx is not None:
-        for line in lines[subject_line_idx + 1:]:
-            body_lines.append(line)
+        body_lines = lines[subject_line_idx + 1:]
 
     # Fallback 2: no markers at all
     if not body_lines and not subject:
@@ -420,48 +423,49 @@ def parse_draft(draft: str) -> tuple[str, str]:
     if not body:
         body = draft.strip()
 
-    # Strip standalone CTA/signoff lines
-    cta_patterns = [
-        r'^worth a quick.*?call\??\.?$',
-        r'^would you be open to a.*?call\??\.?$',
-        r'^(can we|shall we|let\'s) (hop|jump|get) on',
-        r'^schedule a call',
-        r'^book a call',
-        r'^happy to (jump|hop) on',
-        r'^15.minute call',
-        r'^cal\.com',
+    # Strip ONLY our own injected lines — not model content
+    our_patterns = [
         r'overlayCalendar',
-    ]
-    signoff_patterns = [
-        r'^riley,?\s*davinci\s*ai\.?$',
-        r'^riley,?\s*$',
-        r'^- riley$',
-        r'^— riley$',
-        r'^riley,?\s*https?://\S+$',
+        r'cal\.com/deepanshu',
         r'davinciai\.agency',
-        r'^riley,?\s*<a\s',
+        r'^riley,?\s*(davinci|<a|https?://)',
+        r'^[-—]\s*riley$',
+        r'^riley,?\s*$',
     ]
 
     cleaned = []
     for line in body.split("\n"):
         stripped = line.strip()
-        lower    = stripped.lower()
-
-        if any(re.match(p, lower) for p in cta_patterns) \
-           or "overlayCalendar" in line:
-            print(f"🧹 [PARSE] CTA: '{stripped[:50]}'")
+        if not stripped and not cleaned:
+            continue  # skip leading blank lines only
+        is_ours = any(
+            re.search(p, stripped, re.I)
+            for p in our_patterns
+        )
+        if is_ours:
+            print(f"🧹 [PARSE] Stripped: '{stripped[:60]}'")
             continue
-
-        if any(
-            re.search(p, lower, re.I)
-            for p in signoff_patterns
-        ):
-            print(f"🧹 [PARSE] Signoff: '{stripped[:50]}'")
-            continue
-
         cleaned.append(line)
 
-    body = "\n".join(cleaned).strip().rstrip(",. \n")
+    body = "\n".join(cleaned).strip()
+
+    # Safety net: if body is still empty, grab raw content
+    if not body or len(body) < 20:
+        print(
+            f"⚠️  [PARSE] Body empty ({len(body)} chars) "
+            f"— using raw draft"
+        )
+        raw_body = []
+        past_subject = False
+        for line in draft.split("\n"):
+            if re.match(r'^subject\s*:', line.strip(), re.I):
+                past_subject = True
+                continue
+            if re.match(r'^body\s*:', line.strip(), re.I):
+                continue
+            if past_subject:
+                raw_body.append(line)
+        body = "\n".join(raw_body).strip() or draft.strip()
 
     print(
         f"📝 [PARSE] subject='{subject}' "
