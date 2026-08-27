@@ -274,7 +274,8 @@ Write the email now. Output SUBJECT: on line 1, then BODY: on its own line, then
             f"{'─'*40}\n{draft}\n{'─'*40}"
         )
 
-        add_message("riley", user_id, "assistant", draft)
+        # Do NOT add to conversation memory — drafts are
+        # not chat turns and would bloat future requests
         return draft
 
     except Exception as e:
@@ -333,7 +334,7 @@ Output format: SUBJECT: on first line, then BODY: on its own line, then two para
         global session_tokens_used
         session_tokens_used += tokens
 
-        add_message("riley", user_id, "assistant", new_draft)
+        # Do NOT add to conversation memory
         return new_draft, learned
 
     except Exception as e:
