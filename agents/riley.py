@@ -234,13 +234,18 @@ def draft_outreach_email(
 
     from tools.preferences import build_preferences_block
     prefs = build_preferences_block(user_id)
-    if prefs:
-        system = "CEO PREFERENCES:\n" + "\n".join(prefs) + "\n\n" + system
 
-    # DEBUG: log exact sizes so we can find the bloat
+    # Hard cap — never let preferences bloat the system prompt
+    # Max 10 preferences, max 600 chars total
+    if prefs:
+        prefs = prefs[:10]
+        prefs_text = "\n".join(prefs)[:600]
+        system = "CEO PREFERENCES:\n" + prefs_text + "\n\n" + system
+        print(f"🧠 [RILEY v3] prefs={len(prefs)} items, {len(prefs_text)} chars injected")
+    else:
+        print("🧠 [RILEY v3] no preferences")
+
     print(f"📏 [RILEY v3] system={len(system)} chars (~{len(system)//4} tokens)")
-    print(f"📏 [RILEY v3] prefs={len(prefs) if prefs else 0} items, {sum(len(p) for p in prefs) if prefs else 0} chars")
-    print(f"📏 [RILEY v3] research={len(research)} chars")
 
     research_block = (
         research.strip()[:600]
@@ -330,7 +335,9 @@ def draft_with_feedback(
     prefs = build_preferences_block(user_id)
     system = _load_skill("email_template.txt")
     if prefs:
-        system = "CEO PREFERENCES:\n" + "\n".join(prefs) + "\n\n" + system
+        prefs = prefs[:10]
+        prefs_text = "\n".join(prefs)[:600]
+        system = "CEO PREFERENCES:\n" + prefs_text + "\n\n" + system
 
     task = f"""Rewrite this email draft applying the feedback below.
 
