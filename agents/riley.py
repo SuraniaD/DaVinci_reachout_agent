@@ -256,6 +256,9 @@ Write the email now. Output SUBJECT: on line 1, then BODY: on its own line, then
         detail="Drafting email"
     )
 
+    # VERSION MARKER — confirms new riley.py is running
+    print(f"🔖 [RILEY v3] draft_outreach_email called for '{business_name}'")
+
     # Clear conversation history before drafting.
     # Drafts must never include prior chat or draft
     # history — each is a clean isolated API call.
