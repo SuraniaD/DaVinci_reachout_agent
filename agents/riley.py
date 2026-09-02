@@ -159,7 +159,9 @@ def _load_skill(filename: str) -> str:
         if os.path.exists(path):
             try:
                 with open(path) as f:
-                    return f.read()
+                    content = f.read()
+                print(f"✅ [SKILL] Loaded '{filename}' from {path} ({len(content)} chars)")
+                return content
             except Exception as e:
                 print(f"⚠️  Could not read {path}: {e}")
 
@@ -234,6 +236,11 @@ def draft_outreach_email(
     prefs = build_preferences_block(user_id)
     if prefs:
         system = "CEO PREFERENCES:\n" + "\n".join(prefs) + "\n\n" + system
+
+    # DEBUG: log exact sizes so we can find the bloat
+    print(f"📏 [RILEY v3] system={len(system)} chars (~{len(system)//4} tokens)")
+    print(f"📏 [RILEY v3] prefs={len(prefs) if prefs else 0} items, {sum(len(p) for p in prefs) if prefs else 0} chars")
+    print(f"📏 [RILEY v3] research={len(research)} chars")
 
     research_block = (
         research.strip()[:600]
