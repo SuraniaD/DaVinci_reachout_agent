@@ -256,6 +256,17 @@ Write the email now. Output SUBJECT: on line 1, then BODY: on its own line, then
         detail="Drafting email"
     )
 
+    # Clear conversation history before drafting.
+    # Drafts must never include prior chat or draft
+    # history — each is a clean isolated API call.
+    # This prevents token accumulation from any code
+    # path that may write drafts to memory.
+    try:
+        from memory import clear_history
+        clear_history("riley", user_id)
+    except Exception:
+        pass
+
     try:
         draft, tokens = _call_groq_with_retry(
             messages=[
