@@ -253,13 +253,16 @@ def draft_outreach_email(
         else "No research available."
     )
 
-    task = f"""Business: {business_name}
-Contact: {contact_name}
-
-Research:
-{research_block}
-
-Write the email now. Output SUBJECT: on line 1, then BODY: on its own line, then two paragraphs."""
+    # gpt-oss models blank on system prompts but respond to user messages
+    # so we embed the full template + task in the user turn
+    task = (
+        f"{system}\n\n"
+        f"---\n\n"
+        f"Business: {business_name}\n"
+        f"Contact: {contact_name}\n\n"
+        f"Research:\n{research_block}\n\n"
+        f"Write the email now following the instructions above exactly."
+    )
 
     log_action(
         action_type="draft",
@@ -283,10 +286,10 @@ Write the email now. Output SUBJECT: on line 1, then BODY: on its own line, then
         pass
 
     try:
+        # Template is embedded in task (user turn) — gpt-oss blanks on system prompts
         draft, tokens = _call_groq_with_retry(
             messages=[
-                {"role": "system", "content": system},
-                {"role": "user",   "content": task}
+                {"role": "user", "content": task}
             ],
             max_tokens=400,
             temperature=0.8
@@ -299,24 +302,6 @@ Write the email now. Output SUBJECT: on line 1, then BODY: on its own line, then
             f"📝 [DRAFT RAW] '{business_name}':\n"
             f"{'─'*40}\n{draft}\n{'─'*40}"
         )
-
-        # If model returned empty, retry with a minimal prompt
-        if not draft or not draft.strip():
-            print(f"⚠️  [DRAFT] Empty response — retrying with minimal prompt")
-            simple_task = (
-                f"Write a short cold outreach email for DaVinci AI to {business_name}.\n\n"
-                f"DaVinci AI builds AI agent systems that automate business workflows.\n\n"
-                f"Format:\nSUBJECT: <subject line>\nBODY:\n"
-                f"<paragraph 1 — specific observation about {business_name}>\n\n"
-                f"<paragraph 2 — what DaVinci AI can do for them>"
-            )
-            draft, tokens2 = _call_groq_with_retry(
-                messages=[{"role": "user", "content": simple_task}],
-                max_tokens=400,
-                temperature=0.7
-            )
-            session_tokens_used += tokens2
-            print(f"📝 [DRAFT RETRY]:\n{'─'*40}\n{draft}\n{'─'*40}")
 
         # Do NOT add to conversation memory
         return draft
@@ -367,10 +352,10 @@ Apply the feedback exactly. Keep what works, fix what was flagged.
 Output format: SUBJECT: on first line, then BODY: on its own line, then two paragraphs only."""
 
     try:
+        # Template embedded in task — gpt-oss blanks on system prompts
         new_draft, tokens = _call_groq_with_retry(
             messages=[
-                {"role": "system", "content": system},
-                {"role": "user",   "content": task}
+                {"role": "user", "content": f"{system}\n\n---\n\n{task}"}
             ],
             max_tokens=400,
             temperature=0.7
