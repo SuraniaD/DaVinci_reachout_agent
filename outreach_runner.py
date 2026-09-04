@@ -44,9 +44,7 @@ def process_prospect_from_db(
     1. Skip if no email
     2. Skip if research_summary missing or < 50 chars
     3. Skip if draft body is empty after parsing
-
-    Saves draft to email_drafts.
-    Updates prospect status to draft_ready.
+    4. Verify draft (x1 × x2 ≥ 0.81) — redraft up to MAX_DRAFT_RETRIES
     """
     name         = prospect.get("contact_name") or \
                    prospect.get("business_name", "")
@@ -140,8 +138,6 @@ def process_prospect_from_db(
         )
 
         # ── GUARD 3: empty body ───────────
-        # Strip HTML and CTA to check if there's
-        # actual body content from the model
         body_check = re.sub(r'<[^>]+>', '', body)
         body_check = body_check.replace(
             "Worth a quick 15-minute call?", ""
@@ -167,6 +163,76 @@ def process_prospect_from_db(
                     status="skipped"
                 )
             return None
+
+        # ── VERIFICATION GATE (x1 × x2 ≥ 0.81) ──
+        from tools.verifier import (
+            verify_draft,
+            save_verification_result
+        )
+        from config import MAX_DRAFT_RETRIES
+
+        revision = 0
+        while True:
+            result = verify_draft(
+                prospect=prospect,
+                draft_subject=subject,
+                draft_body=body,
+                revision_count=revision
+            )
+
+            say_fn(
+                f"🔬 *{business}* — "
+                f"x1={result.x1_score:.2f} "
+                f"x2={result.x2_score:.2f} "
+                f"combined={result.combined_score:.3f} "
+                f"{'✅' if result.passed else '❌'}"
+            )
+
+            if result.passed:
+                save_verification_result(
+                    prospect_id=str(prospect_id),
+                    draft_subject=subject,
+                    draft_body=body,
+                    result=result
+                )
+                break
+
+            if revision >= MAX_DRAFT_RETRIES:
+                print(
+                    f"⏭️  [VERIFY] Max retries for '{business}'"
+                )
+                say_fn(
+                    f"⏭️ Skipping *{business}* — "
+                    f"failed verification after "
+                    f"{MAX_DRAFT_RETRIES} attempts.\n"
+                    f"_{result.failure_reason}_"
+                )
+                if prospect_id:
+                    update_prospect_status(
+                        prospect_id=prospect_id,
+                        status="skipped"
+                    )
+                return None
+
+            revision += 1
+            print(
+                f"🔄 [VERIFY] Redrafting '{business}' "
+                f"(attempt {revision}) — {result.failure_reason}"
+            )
+            say_fn(
+                f"🔄 Redrafting *{business}* "
+                f"(attempt {revision})..."
+            )
+
+            new_draft, _ = draft_with_feedback(
+                user_id=user_id,
+                feedback=result.feedback,
+                original_draft=draft,
+                contact_name=name,
+                business_name=business
+            )
+            draft = new_draft
+            subject, body = parse_draft(draft)
 
         # Save draft to email_drafts table
         draft_row = save_draft(
