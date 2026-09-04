@@ -65,7 +65,7 @@ WEBSITE_LINK = "https://davinciai.agency"
 
 CTA_LINE = (
     f'Worth a quick <a href="{BOOKING_LINK}">'
-    f"15-minute call</a>?"
+    f"call</a>?"
 )
 SIGNOFF_LINE = (
     f'Riley, <a href="{WEBSITE_LINK}">DaVinci AI</a>'
