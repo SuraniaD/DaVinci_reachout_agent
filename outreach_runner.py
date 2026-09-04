@@ -171,6 +171,7 @@ def process_prospect_from_db(
         )
         from config import MAX_DRAFT_RETRIES
 
+
         revision = 0
         while True:
             result = verify_draft(
