@@ -20,7 +20,7 @@ client = Groq(
     api_key=os.environ.get("GROQ_API_KEY_RILEY")
 )
 
-CHAT_MODEL = "openai/gpt-oss-20b"
+CHAT_MODEL = "openai/gpt-oss-120b"
 
 RILEY_SYSTEM_PROMPT = """
 You are Riley, Outreach Manager at DaVinci AI.
