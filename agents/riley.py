@@ -118,16 +118,18 @@ def _call_groq_with_retry(
 ) -> tuple[str, int]:
     for attempt in range(2):
         try:
+            print(f"🤖 [GROQ] Calling {CHAT_MODEL} (attempt {attempt+1}), max_tokens={max_tokens}")
             response = client.chat.completions.create(
                 model=CHAT_MODEL, messages=messages,
                 max_tokens=max_tokens,
                 temperature=temperature
             )
-            return (
-                response.choices[0].message.content,
-                response.usage.total_tokens
-            )
+            content = response.choices[0].message.content
+            tokens  = response.usage.total_tokens
+            print(f"🤖 [GROQ] Response: {tokens} tokens, content_len={len(content) if content else 0}")
+            return content, tokens
         except Exception as e:
+            print(f"🤖 [GROQ] Error (attempt {attempt+1}): {e}")
             if "rate_limit" in str(e) and attempt == 0:
                 time.sleep(60)
                 continue
