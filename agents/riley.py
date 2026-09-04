@@ -259,7 +259,11 @@ def draft_outreach_email(
         f"Business: {business_name}\n"
         f"Contact: {contact_name}\n\n"
         f"Research:\n{research_block}\n\n"
-        f"Write the email now. Output SUBJECT: on line 1, then BODY: on its own line, then two paragraphs."
+        f"Write the complete email now. You MUST write both paragraphs and the final two lines (CTA + signoff). "
+        f"Do not stop after paragraph 1. Output format:\n"
+        f"SUBJECT: <subject>\nBODY:\n<paragraph 1>\n\n<paragraph 2>\n\n"
+        f'Worth a quick <a href="https://cal.com/deepanshu-surania/discovery-call?overlayCalendar=true">15-minute call</a>?\n\n'
+        f'Riley, <a href="https://davinciai.agency">DaVinci AI</a>'
     )
 
     log_action(
@@ -289,7 +293,7 @@ def draft_outreach_email(
                 {"role": "system", "content": system},
                 {"role": "user",   "content": task}
             ],
-            max_tokens=1024,
+            max_tokens=2048,
             temperature=0.8
         )
 
@@ -302,14 +306,14 @@ def draft_outreach_email(
         )
 
         # Retry if draft is too short to be a complete email
-        if not draft or len(draft.strip()) < 200:
-            print(f"⚠️  [DRAFT] Too short ({len(draft.strip()) if draft else 0} chars) — retrying at lower temp")
+        if not draft or len(draft.strip()) < 350:
+            print(f"⚠️  [DRAFT] Too short ({len(draft.strip()) if draft else 0} chars) — retrying")
             draft, tokens2 = _call_groq_with_retry(
                 messages=[
                     {"role": "system", "content": system},
                     {"role": "user",   "content": task}
                 ],
-                max_tokens=1024,
+                max_tokens=2048,
                 temperature=0.5
             )
             session_tokens_used += tokens2
@@ -369,7 +373,7 @@ Output format: SUBJECT: on first line, then BODY: on its own line, then two para
                 {"role": "system", "content": system},
                 {"role": "user",   "content": task}
             ],
-            max_tokens=1024,
+            max_tokens=2048,
             temperature=0.7
         )
 
