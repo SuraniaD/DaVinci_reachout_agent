@@ -165,12 +165,16 @@ def process_prospect_from_db(
             return None
 
         # ── VERIFICATION GATE (x1 × x2 ≥ 0.81) ──
-        from tools.verifier import (
-            verify_draft,
-            save_verification_result
-        )
-        from config import MAX_DRAFT_RETRIES
-
+        print(f"🔬 [OUTREACH] Entering verification gate for '{business}'")
+        try:
+            from tools.verifier import (
+                verify_draft,
+                save_verification_result
+            )
+            from config import MAX_DRAFT_RETRIES
+        except Exception as import_err:
+            print(f"❌ [VERIFY IMPORT] Failed: {import_err}")
+            raise import_err
 
         revision = 0
         while True:
