@@ -20,7 +20,7 @@ client = Groq(
     api_key=os.environ.get("GROQ_API_KEY_RILEY")
 )
 
-CHAT_MODEL = "llama-3.3-70b-versatile"
+CHAT_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 
 RILEY_SYSTEM_PROMPT = """
 You are Riley, Outreach Manager at DaVinci AI.
