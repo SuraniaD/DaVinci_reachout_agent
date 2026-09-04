@@ -65,7 +65,7 @@ WEBSITE_LINK = "https://davinciai.agency"
 
 CTA_LINE = (
     f'Worth a quick <a href="{BOOKING_LINK}">'
-    f"call</a>?"
+    f"15-minute call</a>?"
 )
 SIGNOFF_LINE = (
     f'Riley, <a href="{WEBSITE_LINK}">DaVinci AI</a>'
@@ -300,6 +300,20 @@ def draft_outreach_email(
             f"📝 [DRAFT RAW] '{business_name}':\n"
             f"{'─'*40}\n{draft}\n{'─'*40}"
         )
+
+        # Retry if draft is too short to be a complete email
+        if not draft or len(draft.strip()) < 200:
+            print(f"⚠️  [DRAFT] Too short ({len(draft.strip()) if draft else 0} chars) — retrying at lower temp")
+            draft, tokens2 = _call_groq_with_retry(
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user",   "content": task}
+                ],
+                max_tokens=1024,
+                temperature=0.5
+            )
+            session_tokens_used += tokens2
+            print(f"📝 [DRAFT RETRY] '{business_name}':\n{'─'*40}\n{draft}\n{'─'*40}")
 
         # Do NOT add to conversation memory
         return draft
