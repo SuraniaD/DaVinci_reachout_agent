@@ -20,7 +20,7 @@ client = Groq(
     api_key=os.environ.get("GROQ_API_KEY_RILEY")
 )
 
-CHAT_MODEL = "llama-3.1-8b-instant"
+CHAT_MODEL = "openai/gpt-oss-20b"
 
 RILEY_SYSTEM_PROMPT = """
 You are Riley, Outreach Manager at DaVinci AI.
@@ -287,7 +287,7 @@ def draft_outreach_email(
                 {"role": "system", "content": system},
                 {"role": "user",   "content": task}
             ],
-            max_tokens=400,
+            max_tokens=1024,
             temperature=0.8
         )
 
@@ -353,7 +353,7 @@ Output format: SUBJECT: on first line, then BODY: on its own line, then two para
                 {"role": "system", "content": system},
                 {"role": "user",   "content": task}
             ],
-            max_tokens=400,
+            max_tokens=1024,
             temperature=0.7
         )
 
