@@ -20,7 +20,7 @@ client = Groq(
     api_key=os.environ.get("GROQ_API_KEY_RILEY")
 )
 
-CHAT_MODEL = "openai/gpt-oss-120b"
+CHAT_MODEL = "llama-3.1-8b-instant"
 
 RILEY_SYSTEM_PROMPT = """
 You are Riley, Outreach Manager at DaVinci AI.
@@ -253,15 +253,11 @@ def draft_outreach_email(
         else "No research available."
     )
 
-    # gpt-oss models blank on system prompts but respond to user messages
-    # so we embed the full template + task in the user turn
     task = (
-        f"{system}\n\n"
-        f"---\n\n"
         f"Business: {business_name}\n"
         f"Contact: {contact_name}\n\n"
         f"Research:\n{research_block}\n\n"
-        f"Write the email now following the instructions above exactly."
+        f"Write the email now. Output SUBJECT: on line 1, then BODY: on its own line, then two paragraphs."
     )
 
     log_action(
@@ -286,10 +282,10 @@ def draft_outreach_email(
         pass
 
     try:
-        # Template is embedded in task (user turn) — gpt-oss blanks on system prompts
         draft, tokens = _call_groq_with_retry(
             messages=[
-                {"role": "user", "content": task}
+                {"role": "system", "content": system},
+                {"role": "user",   "content": task}
             ],
             max_tokens=400,
             temperature=0.8
@@ -352,10 +348,10 @@ Apply the feedback exactly. Keep what works, fix what was flagged.
 Output format: SUBJECT: on first line, then BODY: on its own line, then two paragraphs only."""
 
     try:
-        # Template embedded in task — gpt-oss blanks on system prompts
         new_draft, tokens = _call_groq_with_retry(
             messages=[
-                {"role": "user", "content": f"{system}\n\n---\n\n{task}"}
+                {"role": "system", "content": system},
+                {"role": "user",   "content": task}
             ],
             max_tokens=400,
             temperature=0.7
