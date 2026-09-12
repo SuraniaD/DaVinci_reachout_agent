@@ -1068,20 +1068,26 @@ def _handle_review_action(
 # RILEY EVENT HANDLER
 # ═══════════════════════════════════════════
 
+# @riley_app.event("message")
+# def handle_riley_dm(event, say):
+#     if event.get("bot_id"):
+#         return
+#     if event.get("channel_type") != "im":
+#         return
+
+#     user_id = event["user"]
+#     text    = event.get("text", "").strip()
+
+#     print(
+#         f"\n📧 [RILEY DM] "
+#         f"'{text[:60]}{'...' if len(text) > 60 else ''}'"
+#     )
+
 @riley_app.event("message")
 def handle_riley_dm(event, say):
-    if event.get("bot_id"):
-        return
-    if event.get("channel_type") != "im":
-        return
-
-    user_id = event["user"]
-    text    = event.get("text", "").strip()
-
-    print(
-        f"\n📧 [RILEY DM] "
-        f"'{text[:60]}{'...' if len(text) > 60 else ''}'"
-    )
+    # DISABLED — Riley v2.0 (LangGraph) on separate Railway service
+    # handles all Riley DMs. This handler is intentionally empty.
+    return
 
     # FILE UPLOAD
     if event.get("files"):
