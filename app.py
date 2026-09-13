@@ -82,10 +82,10 @@ load_dotenv()
 # SLACK APPS
 # ─────────────────────────────────────────
 
-riley_app = App(
-    token=os.environ.get("RILEY_BOT_TOKEN"),
-    signing_secret=os.environ.get("RILEY_SIGNING_SECRET")
-)
+# riley_app = App(
+#     token=os.environ.get("RILEY_BOT_TOKEN"),
+#     signing_secret=os.environ.get("RILEY_SIGNING_SECRET")
+# )
 dexter_app = App(
     token=os.environ.get("DEXTER_BOT_TOKEN"),
     signing_secret=os.environ.get("DEXTER_SIGNING_SECRET")
@@ -1422,17 +1422,15 @@ if __name__ == "__main__":
     dexter_thread.start()
     print("✅ Dexter live.")
 
-    print("📧 Starting Riley...")
-    riley_handler = SocketModeHandler(
-        riley_app,
-        os.environ.get("RILEY_APP_TOKEN")
-    )
+    # print("📧 Starting Riley...")
+    # riley_handler = SocketModeHandler(
+    #     riley_app,
+    #     os.environ.get("RILEY_APP_TOKEN")
+    # )
 
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    print("✅ DaVinci AI v2.0 live.")
+    print("✅ DaVinci AI — Dexter only.")
     print("   Dexter → research + verify leads")
-    print("   Riley  → draft + verify + send (Resend)")
-    print("   Follow-up scheduler → day 7 + day 14")
+    print("   Riley  → handled by separate service")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-
-    riley_handler.start()
+    # riley_handler.start()
