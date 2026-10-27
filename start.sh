@@ -1,3 +1,2 @@
 #!/bin/bash
-python app.py &
-python riley_app.py
+python app.py 
